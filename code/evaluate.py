@@ -25,7 +25,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data_processor import DataProcessor
 from environment import PortfolioEnv
 from agents import QRDDPGAgent
-from benchmarks import BacktestBenchmark
+from benchmark_strategies import BacktestBenchmark
 
 
 class EvaluateStrategies:
