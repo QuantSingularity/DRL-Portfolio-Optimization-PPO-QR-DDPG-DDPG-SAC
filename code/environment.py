@@ -1,5 +1,9 @@
 """
 Custom Portfolio Environment for RL Training.
+
+This module implements the Markov Decision Process (MDP) formulation
+with risk-aware reward function.
+
 """
 
 from __future__ import annotations

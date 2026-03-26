@@ -1,5 +1,9 @@
 """
 Transaction Cost Analysis Module.
+
+Analyzes portfolio performance under different transaction cost structures
+and rebalancing frequencies.
+
 """
 
 from __future__ import annotations

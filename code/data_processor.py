@@ -1,5 +1,11 @@
 """
 Data preprocessing and feature engineering module.
+
+This module handles:
+1. Data fetching from Yahoo Finance
+2. Technical indicator calculation
+3. Feature engineering for the RL environment
+4. Data cleaning and normalization
 """
 
 from __future__ import annotations

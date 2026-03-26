@@ -1,5 +1,13 @@
 """
 Main training script for RL agents.
+
+This script:
+1. Loads and processes data
+2. Creates training environment
+3. Trains DRL agents (PPO, DDPG, SAC, QR-DDPG)
+4. Evaluates agents
+5. Saves results
+
 """
 
 from __future__ import annotations

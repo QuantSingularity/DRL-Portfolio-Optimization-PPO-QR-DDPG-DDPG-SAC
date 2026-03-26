@@ -1,5 +1,12 @@
 """
 Evaluation script for comparing all strategies (DRL + Benchmarks).
+
+This script:
+1. Evaluates trained DRL agents
+2. Backtests benchmark strategies
+3. Performs statistical significance testing
+4. Generates comparison tables and figures
+
 """
 
 from __future__ import annotations

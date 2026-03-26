@@ -1,5 +1,9 @@
 """
 Production FastAPI Service for RL Portfolio Optimization.
+
+Provides RESTful API for portfolio recommendations, risk monitoring,
+and client reporting.
+
 """
 
 from __future__ import annotations

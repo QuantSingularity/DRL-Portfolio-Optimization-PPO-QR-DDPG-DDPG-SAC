@@ -1,9 +1,4 @@
-# Enhanced Configuration for RL Portfolio Optimization
-# Fixes applied:
-#   - total_timesteps raised from 100_000 to 500_000 (minimum for convergence)
-#   - n_seeds reduced from 10 to 3 (practical default; set back to 10 for papers)
-#   - ^VIX moved out of investable assets into macro_factors (it cannot be held)
-#   - production.api.allowed_origins added (replaces the open "*" CORS policy)
+# Configuration for RL Portfolio Optimization
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:

@@ -1,5 +1,8 @@
 """
 Market Regime Analysis Module.
+
+Classifies market conditions and analyzes algorithm performance
+across different regimes (bull, bear, sideways).
 """
 
 from __future__ import annotations

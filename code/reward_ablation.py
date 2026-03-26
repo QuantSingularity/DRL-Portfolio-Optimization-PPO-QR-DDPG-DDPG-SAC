@@ -1,5 +1,9 @@
 """
 Reward Function Ablation Study Module.
+
+Systematically varies the lambda (drawdown penalty) parameter
+to analyze its impact on agent performance.
+
 """
 
 from __future__ import annotations
