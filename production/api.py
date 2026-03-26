@@ -1,63 +1,142 @@
 """
 Production FastAPI Service for RL Portfolio Optimization.
-
-Provides RESTful API for portfolio recommendations, risk monitoring,
-and client reporting.
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import pandas as pd
-from datetime import datetime
 import yaml
-from pathlib import Path
-import logging
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# Configure logging
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+_ROOT = Path(__file__).resolve().parent.parent
+
+with open(_ROOT / "config" / "config.yaml") as _f:
+    config: Dict[str, Any] = yaml.safe_load(_f)
+
+# ---------------------------------------------------------------------------
+# Model cache (populated at startup)
+# ---------------------------------------------------------------------------
+
+_model_cache: Dict[str, Any] = {}
+
+
+def _load_all_models() -> None:
+    """Load every model in models_dir into memory at startup."""
+    from stable_baselines3 import DDPG, PPO, SAC
+
+    _SB3_MAP = {"ppo": PPO, "ddpg": DDPG, "sac": SAC}
+    models_dir = Path(config["output"]["models_dir"])
+
+    if not models_dir.exists():
+        logger.warning("Models directory not found: %s", models_dir)
+        return
+
+    for path in models_dir.glob("*.zip"):
+        stem = path.stem  # e.g. "ppo_seed_0"
+        prefix = stem.split("_seed_")[0]  # e.g. "ppo"
+        if prefix in _SB3_MAP:
+            try:
+                _model_cache[stem] = _SB3_MAP[prefix].load(str(path.with_suffix("")))
+                logger.info("Loaded model: %s", stem)
+            except Exception as exc:
+                logger.warning("Could not load %s: %s", stem, exc)
+
+    # Custom QR-DDPG models (.pt)
+    for path in models_dir.glob("*.pt"):
+        try:
+            _model_cache[path.stem] = {"checkpoint": path, "type": "qr_ddpg"}
+            logger.info("Registered QR-DDPG checkpoint: %s", path.stem)
+        except Exception as exc:
+            logger.warning("Could not register %s: %s", path.stem, exc)
+
+
+def _get_cached_model(model_name: str):
+    """Return a cached model or raise 404."""
+    # Prefer exact match; fall back to first seed
+    if model_name in _model_cache:
+        return _model_cache[model_name]
+    # Try seed 0 fallback
+    fallback = f"{model_name}_seed_0"
+    if fallback in _model_cache:
+        return _model_cache[fallback]
+    raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (replaces deprecated @app.on_event)
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    logger.info("Starting RL Portfolio Optimization API")
+    _load_all_models()
+    logger.info("Models loaded: %s", list(_model_cache.keys()))
+    yield
+    logger.info("Shutting down API")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+_allowed_origins: List[str] = (
+    config.get("production", {})
+    .get("api", {})
+    .get(
+        "allowed_origins",
+        ["http://localhost", "http://localhost:3000"],  # safe default
+    )
+)
+
 app = FastAPI(
     title="RL Portfolio Optimization API",
     description="Production API for AI-powered portfolio management",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,  # explicit allowlist, not "*"
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-# Load configuration
-with open("config/config.yaml", "r") as f:
-    config = yaml.safe_load(f)
-
-
-# ============================================================================
-# Pydantic Models
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 
 
 class PortfolioRequest(BaseModel):
-    """Request model for portfolio recommendations."""
-
     client_id: str = Field(..., description="Unique client identifier")
-    risk_tolerance: str = Field(..., description="Risk tolerance: low, medium, high")
+    risk_tolerance: str = Field(..., description="low | medium | high")
     investment_amount: float = Field(..., gt=0, description="Investment amount in USD")
     constraints: Optional[Dict] = Field(None, description="Custom constraints")
 
 
 class PortfolioRecommendation(BaseModel):
-    """Response model for portfolio recommendations."""
-
     client_id: str
     timestamp: datetime
     weights: Dict[str, float]
@@ -69,8 +148,6 @@ class PortfolioRecommendation(BaseModel):
 
 
 class RiskAlert(BaseModel):
-    """Model for risk monitoring alerts."""
-
     alert_id: str
     client_id: str
     timestamp: datetime
@@ -82,8 +159,6 @@ class RiskAlert(BaseModel):
 
 
 class PerformanceMetrics(BaseModel):
-    """Model for portfolio performance metrics."""
-
     client_id: str
     period: str
     total_return: float
@@ -94,70 +169,61 @@ class PerformanceMetrics(BaseModel):
     win_rate: float
 
 
-# ============================================================================
-# Utility Functions
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
 
-def load_model(model_name: str):
-    """Load trained RL model."""
-    model_path = Path(config["output"]["models_dir"]) / f"{model_name}.zip"
-
-    if not model_path.exists():
-        raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
-
-    try:
-        # Load model based on algorithm
-        if model_name == "ppo":
-            from stable_baselines3 import PPO
-
-            model = PPO.load(str(model_path))
-        elif model_name == "sac":
-            from stable_baselines3 import SAC
-
-            model = SAC.load(str(model_path))
-        # Add other models as needed
-
-        return model
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        raise HTTPException(status_code=500, detail="Error loading model")
+def _get_all_tickers() -> List[str]:
+    """Return the investable ticker list from config (excludes macro factors)."""
+    assets = config["data"]["assets"]
+    macro = set(config["data"].get("macro_factors", []))
+    tickers: List[str] = []
+    for cls_tickers in assets.values():
+        tickers.extend([t for t in cls_tickers if t not in macro])
+    return tickers
 
 
-def get_market_data(assets: List[str], days: int = 60) -> pd.DataFrame:
-    """Fetch recent market data."""
-    # In production, this would fetch from a database or API
-    # For now, return placeholder
-    logger.info(f"Fetching market data for {len(assets)} assets")
-    return pd.DataFrame()
+def _calculate_risk_metrics(weights: np.ndarray, returns_data: pd.DataFrame) -> Dict:
+    mean_ret = returns_data.mean().values
+    cov = returns_data.cov().values
 
-
-def calculate_risk_metrics(weights: np.ndarray, returns_data: pd.DataFrame) -> Dict:
-    """Calculate portfolio risk metrics."""
-    mean_returns = returns_data.mean()
-    cov_matrix = returns_data.cov()
-
-    portfolio_return = np.dot(weights, mean_returns) * 252
-    portfolio_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(
-        252
-    )
-    sharpe = (portfolio_return - 0.045) / portfolio_vol if portfolio_vol > 0 else 0
+    port_ret = float(np.dot(weights, mean_ret) * 252)
+    port_vol = float(np.sqrt(weights @ cov @ weights) * np.sqrt(252))
+    sharpe = (port_ret - 0.045) / port_vol if port_vol > 0 else 0.0
 
     return {
-        "expected_return": float(portfolio_return * 100),
-        "expected_volatility": float(portfolio_vol * 100),
-        "sharpe_ratio": float(sharpe),
+        "expected_return": port_ret * 100,
+        "expected_volatility": port_vol * 100,
+        "sharpe_ratio": sharpe,
     }
 
 
-# ============================================================================
-# API Endpoints
-# ============================================================================
+def _build_market_state(all_tickers: List[str]) -> np.ndarray:
+    """
+    Construct the current market state vector for model inference.
+
+    Production TODO: replace this stub with a live call to DataProcessor
+    to fetch recent market data and call PortfolioEnv._get_state().
+    For now, returns a zero vector of the correct dimension so the API
+    remains functional without live data.
+    """
+    n_assets = len(all_tickers)
+    n_features = 6  # Close, MACD, RSI, CCI, DX, BollUB
+    state_dim = 1 + n_assets + n_assets * n_features
+    logger.warning(
+        "Using zero state vector (stub). Wire up DataProcessor for live inference."
+    )
+    return np.zeros(state_dim, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.get("/")
 async def root():
-    """Root endpoint."""
     return {
         "message": "RL Portfolio Optimization API",
         "version": "1.0.0",
@@ -167,228 +233,149 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "models_loaded": len(_model_cache),
+    }
 
 
 @app.post("/api/v1/portfolio/recommend", response_model=PortfolioRecommendation)
 async def get_portfolio_recommendation(request: PortfolioRequest):
-    """
-    Get portfolio weight recommendations using trained RL agent.
+    """Return portfolio weight recommendations from the appropriate trained agent."""
+    logger.info("Recommendation request for client %s", request.client_id)
 
-    Args:
-        request: Portfolio recommendation request
+    risk_to_model = {"low": "qr_ddpg", "medium": "ppo", "high": "sac"}
+    model_name = risk_to_model.get(request.risk_tolerance, "ppo")
+    model = _get_cached_model(model_name)
 
-    Returns:
-        Portfolio weights and expected metrics
-    """
+    all_tickers = _get_all_tickers()
+    state = _build_market_state(all_tickers)
+
     try:
-        logger.info(f"Processing recommendation for client {request.client_id}")
+        if isinstance(model, dict) and model.get("type") == "qr_ddpg":
+            # Lazy-load QR-DDPG on first use
+            import torch
+            from agents import QRDDPGAgent
 
-        # Select model based on risk tolerance
-        model_map = {
-            "low": "qr_ddpg",  # Best for tail-risk management
-            "medium": "ppo",  # Best overall Sharpe
-            "high": "sac",  # More exploratory
-        }
+            n = len(all_tickers)
+            dim = 1 + n + n * 6
+            agent = QRDDPGAgent(state_dim=dim, action_dim=n)
+            ckpt = torch.load(model["checkpoint"], map_location="cpu")
+            agent.actor.load_state_dict(ckpt["actor_state_dict"])
+            raw_weights = agent.select_action(state, noise=0.0)
+        else:
+            raw_weights, _ = model.predict(state[np.newaxis], deterministic=True)
+            raw_weights = raw_weights[0]
+    except Exception as exc:
+        logger.error("Inference error: %s", exc)
+        raise HTTPException(status_code=500, detail="Model inference failed") from exc
 
-        model_name = model_map.get(request.risk_tolerance, "ppo")
-        model = load_model(model_name)
+    weights = np.clip(raw_weights, 0, 1)
+    weights = weights / weights.sum() if weights.sum() > 0 else weights
 
-        # Get current market state
-        assets = config["data"]["assets"]
-        all_tickers = sum(assets.values(), [])
-        market_data = get_market_data(all_tickers)
+    weight_dict = {t: round(float(w), 6) for t, w in zip(all_tickers, weights)}
+    risk_metrics: Dict = {}  # Populated once live data pipeline is wired up
 
-        # Get model prediction
-        # In production, construct proper state from market_data
-        state = np.zeros(100)  # Placeholder
-
-        action, _ = model.predict(state, deterministic=True)
-        weights = np.clip(action, 0, 1)
-        weights = weights / weights.sum() if weights.sum() > 0 else weights
-
-        # Calculate risk metrics
-        returns_data = market_data  # Placeholder
-        risk_metrics = (
-            calculate_risk_metrics(weights, returns_data)
-            if len(returns_data) > 0
-            else {}
-        )
-
-        # Create weight dictionary
-        weight_dict = {ticker: float(w) for ticker, w in zip(all_tickers, weights)}
-
-        return PortfolioRecommendation(
-            client_id=request.client_id,
-            timestamp=datetime.now(),
-            weights=weight_dict,
-            expected_return=risk_metrics.get("expected_return", 0),
-            expected_volatility=risk_metrics.get("expected_volatility", 0),
-            sharpe_ratio=risk_metrics.get("sharpe_ratio", 0),
-            max_drawdown_estimate=-15.0,  # Placeholder
-            confidence_score=0.85,
-        )
-
-    except Exception as e:
-        logger.error(f"Error in recommendation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return PortfolioRecommendation(
+        client_id=request.client_id,
+        timestamp=datetime.now(),
+        weights=weight_dict,
+        expected_return=risk_metrics.get("expected_return", 0.0),
+        expected_volatility=risk_metrics.get("expected_volatility", 0.0),
+        sharpe_ratio=risk_metrics.get("sharpe_ratio", 0.0),
+        max_drawdown_estimate=-15.0,  # stub — replace with live VaR estimate
+        confidence_score=0.85,  # stub — replace with ensemble disagreement
+    )
 
 
 @app.get("/api/v1/portfolio/performance/{client_id}", response_model=PerformanceMetrics)
 async def get_portfolio_performance(client_id: str, period: str = "1M"):
     """
-    Get portfolio performance metrics for a client.
+    Return performance metrics for a client.
 
-    Args:
-        client_id: Client identifier
-        period: Time period (1D, 1W, 1M, 3M, 6M, 1Y)
-
-    Returns:
-        Performance metrics
+    NOTE: Currently returns stub values.
+    Production: fetch real metrics from a time-series database keyed by client_id.
     """
-    try:
-        # In production, fetch from database
-        logger.info(f"Fetching performance for client {client_id}, period {period}")
-
-        return PerformanceMetrics(
-            client_id=client_id,
-            period=period,
-            total_return=12.5,
-            annualized_return=25.3,
-            volatility=15.2,
-            sharpe_ratio=1.85,
-            max_drawdown=-8.5,
-            win_rate=0.65,
-        )
-
-    except Exception as e:
-        logger.error(f"Error fetching performance: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    logger.info("Performance request: client=%s period=%s", client_id, period)
+    # TODO: replace with real DB lookup
+    return PerformanceMetrics(
+        client_id=client_id,
+        period=period,
+        total_return=12.5,
+        annualized_return=25.3,
+        volatility=15.2,
+        sharpe_ratio=1.85,
+        max_drawdown=-8.5,
+        win_rate=0.65,
+    )
 
 
 @app.get("/api/v1/risk/monitor/{client_id}", response_model=List[RiskAlert])
 async def monitor_portfolio_risk(client_id: str):
-    """
-    Monitor portfolio for risk violations.
+    """Check portfolio for risk-threshold violations and return active alerts."""
+    logger.info("Risk monitoring: client=%s", client_id)
 
-    Args:
-        client_id: Client identifier
+    alerts: List[RiskAlert] = []
+    current_dd = -12.5  # TODO: fetch live drawdown from portfolio store
+    threshold = config["production"]["risk_monitoring"]["max_drawdown_alert"] * 100
 
-    Returns:
-        List of active risk alerts
-    """
-    try:
-        logger.info(f"Monitoring risk for client {client_id}")
-
-        alerts = []
-
-        # Check drawdown
-        current_dd = -12.5
-        max_dd_threshold = (
-            config["production"]["risk_monitoring"]["max_drawdown_alert"] * 100
-        )
-
-        if abs(current_dd) > max_dd_threshold:
-            alerts.append(
-                RiskAlert(
-                    alert_id=f"DD_{client_id}_{datetime.now().timestamp()}",
-                    client_id=client_id,
-                    timestamp=datetime.now(),
-                    alert_type="MAX_DRAWDOWN",
-                    severity="WARNING",
-                    message=f"Drawdown exceeded threshold: {current_dd:.1f}% > {max_dd_threshold:.1f}%",
-                    current_value=current_dd,
-                    threshold=-max_dd_threshold,
-                )
+    if abs(current_dd) > threshold:
+        alerts.append(
+            RiskAlert(
+                alert_id=f"DD_{client_id}_{datetime.now().timestamp():.0f}",
+                client_id=client_id,
+                timestamp=datetime.now(),
+                alert_type="MAX_DRAWDOWN",
+                severity="WARNING",
+                message=f"Drawdown {current_dd:.1f}% exceeds threshold {-threshold:.1f}%",
+                current_value=current_dd,
+                threshold=-threshold,
             )
-
-        return alerts
-
-    except Exception as e:
-        logger.error(f"Error in risk monitoring: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        )
+    return alerts
 
 
 @app.post("/api/v1/rebalance/{client_id}")
 async def trigger_rebalance(client_id: str, background_tasks: BackgroundTasks):
-    """
-    Trigger portfolio rebalancing for a client.
-
-    Args:
-        client_id: Client identifier
-        background_tasks: FastAPI background tasks
-
-    Returns:
-        Rebalancing status
-    """
-    try:
-        logger.info(f"Triggering rebalance for client {client_id}")
-
-        # Add rebalancing task to background
-        background_tasks.add_task(execute_rebalance, client_id)
-
-        return {
-            "status": "pending",
-            "client_id": client_id,
-            "message": "Rebalancing scheduled",
-            "timestamp": datetime.now().isoformat(),
-        }
-
-    except Exception as e:
-        logger.error(f"Error triggering rebalance: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Schedule a portfolio rebalance to run in the background."""
+    logger.info("Rebalance triggered for client %s", client_id)
+    background_tasks.add_task(_execute_rebalance, client_id)
+    return {
+        "status": "pending",
+        "client_id": client_id,
+        "message": "Rebalancing scheduled",
+        "timestamp": datetime.now().isoformat(),
+    }
 
 
 @app.get("/api/v1/models/list")
 async def list_available_models():
-    """List all available trained models."""
-    try:
-        models_dir = Path(config["output"]["models_dir"])
-        models = [f.stem for f in models_dir.glob("*.zip")]
-
-        return {"models": models, "count": len(models)}
-
-    except Exception as e:
-        logger.error(f"Error listing models: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """List all models currently loaded in the cache."""
+    return {"models": list(_model_cache.keys()), "count": len(_model_cache)}
 
 
-# ============================================================================
-# Background Tasks
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Background tasks
+# ---------------------------------------------------------------------------
 
 
-async def execute_rebalance(client_id: str):
-    """Execute portfolio rebalancing in background."""
-    logger.info(f"Executing rebalance for {client_id}")
-    # Implementation here
+async def _execute_rebalance(client_id: str) -> None:
+    """Execute portfolio rebalancing (stub — wire up order management system)."""
+    logger.info("Executing rebalance for %s", client_id)
 
 
-# ============================================================================
-# Startup/Shutdown Events
-# ============================================================================
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize services on startup."""
-    logger.info("Starting RL Portfolio Optimization API")
-    logger.info(f"Configuration loaded: {len(config)} sections")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown."""
-    logger.info("Shutting down API")
-
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
 
+    api_cfg = config["production"]["api"]
     uvicorn.run(
         "api:app",
-        host=config["production"]["api"]["host"],
-        port=config["production"]["api"]["port"],
-        reload=True,
+        host=api_cfg["host"],
+        port=api_cfg["port"],
+        reload=False,  # never use reload=True in production
     )

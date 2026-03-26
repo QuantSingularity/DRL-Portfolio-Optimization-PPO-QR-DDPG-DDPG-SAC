@@ -1,58 +1,56 @@
 """
 Main training script for RL agents.
-
-This script:
-1. Loads and processes data
-2. Creates training environment
-3. Trains DRL agents (PPO, DDPG, SAC, QR-DDPG)
-4. Evaluates agents
-5. Saves results
 """
 
-import os
+from __future__ import annotations
+
 import sys
-import yaml
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
-from stable_baselines3 import PPO, DDPG, SAC
+import yaml
+from stable_baselines3 import DDPG, PPO, SAC
 from stable_baselines3.common.vec_env import DummyVecEnv
-import warnings
 
 warnings.filterwarnings("ignore")
 
-# Add src to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Resolve project root independent of CWD
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from agents import QRDDPGAgent
 from data_processor import DataProcessor
 from environment import PortfolioEnv
-from agents import QRDDPGAgent
 
 
 class TrainDRLAgents:
-    """Train and evaluate DRL agents."""
+    """Train and evaluate DRL agents for portfolio optimisation."""
 
-    def __init__(self, config_path: str = "../config/config.yaml"):
-        """
-        Initialize trainer.
+    def __init__(self, config_path: str | Path | None = None) -> None:
+        if config_path is None:
+            config_path = _ROOT / "config" / "config.yaml"
 
-        Args:
-            config_path: Path to configuration file
-        """
-        with open(config_path, "r") as f:
+        with open(config_path) as f:
             self.config = yaml.safe_load(f)
 
-        self.results_dir = self.config["output"]["results_dir"]
-        self.models_dir = self.config["output"]["models_dir"]
+        self.results_dir = Path(self.config["output"]["results_dir"])
+        self.models_dir = Path(self.config["output"]["models_dir"])
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.models_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create directories
-        os.makedirs(self.results_dir, exist_ok=True)
-        os.makedirs(self.models_dir, exist_ok=True)
+        self.train_data: pd.DataFrame | None = None
+        self.test_data: pd.DataFrame | None = None
 
-        print("Training configuration loaded")
+        print("Training configuration loaded from:", config_path)
 
-    def prepare_data(self):
-        """Load and process data."""
+    # ------------------------------------------------------------------ #
+    # Data                                                                  #
+    # ------------------------------------------------------------------ #
+
+    def prepare_data(self) -> None:
         print("\n" + "=" * 50)
         print("STEP 1: Data Preparation")
         print("=" * 50)
@@ -60,309 +58,231 @@ class TrainDRLAgents:
         processor = DataProcessor(self.config)
         self.train_data, self.test_data = processor.process_all()
 
-        print(f"\nTrain data shape: {self.train_data.shape}")
-        print(f"Test data shape: {self.test_data.shape}")
-        print(f"Number of assets: {self.train_data['tic'].nunique()}")
+        print(f"\nTrain data shape : {self.train_data.shape}")
+        print(f"Test  data shape : {self.test_data.shape}")
+        print(f"Number of assets : {self.train_data['tic'].nunique()}")
 
-    def create_env(self, data: pd.DataFrame, is_training: bool = True):
+    # ------------------------------------------------------------------ #
+    # Environment factory                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _make_env(self, data: pd.DataFrame) -> DummyVecEnv:
         """
-        Create portfolio environment.
-
-        Args:
-            data: Processed DataFrame
-            is_training: Whether this is for training or testing
-
-        Returns:
-            Wrapped environment
+        Wrap a PortfolioEnv in DummyVecEnv for SB3 compatibility.
+        Uses a closure so each call creates a fresh environment.
         """
-        env_config = self.config["environment"]
-        risk_config = self.config["risk"]
+        env_cfg = self.config["environment"]
+        risk_cfg = self.config["risk"]
 
-        env = PortfolioEnv(
+        def _factory():
+            return PortfolioEnv(
+                df=data,
+                initial_amount=env_cfg["initial_amount"],
+                transaction_cost_pct=env_cfg["transaction_cost_pct"],
+                max_drawdown_penalty=risk_cfg["max_drawdown_penalty"],
+                hmax=env_cfg.get("hmax", 0.30),
+                print_verbosity=env_cfg.get("print_verbosity", 50),
+            )
+
+        return DummyVecEnv([_factory])
+
+    def _make_raw_env(self, data: pd.DataFrame) -> PortfolioEnv:
+        """Create an unwrapped PortfolioEnv (for custom agents and evaluation)."""
+        env_cfg = self.config["environment"]
+        risk_cfg = self.config["risk"]
+        return PortfolioEnv(
             df=data,
-            initial_amount=env_config["initial_amount"],
-            transaction_cost_pct=env_config["transaction_cost_pct"],
-            max_drawdown_penalty=risk_config["max_drawdown_penalty"],
-            hmax=env_config["hmax"],
-            print_verbosity=env_config["print_verbosity"],
+            initial_amount=env_cfg["initial_amount"],
+            transaction_cost_pct=env_cfg["transaction_cost_pct"],
+            max_drawdown_penalty=risk_cfg["max_drawdown_penalty"],
+            hmax=env_cfg.get("hmax", 0.30),
+            print_verbosity=env_cfg.get("print_verbosity", 1000),
         )
 
-        # Wrap for Stable-Baselines3
-        env = DummyVecEnv([lambda: env])
+    # ------------------------------------------------------------------ #
+    # SB3 agent training helpers                                            #
+    # ------------------------------------------------------------------ #
 
-        return env
+    def _sb3_train(self, ModelClass, model_kwargs: dict, name: str, seed: int):
+        env = self._make_env(self.train_data)
+        train_cfg = self.config["training"]
+
+        model = ModelClass(
+            "MlpPolicy",
+            env,
+            **model_kwargs,
+            policy_kwargs=dict(net_arch=[128, 64]),
+            verbose=0,
+            seed=seed,
+        )
+        model.learn(
+            total_timesteps=train_cfg["total_timesteps"],
+            log_interval=train_cfg["log_interval"],
+        )
+        path = self.models_dir / f"{name}_seed_{seed}"
+        model.save(str(path))
+        return model
 
     def train_ppo(self, seed: int = 0):
-        """
-        Train PPO agent.
-
-        Args:
-            seed: Random seed
-
-        Returns:
-            Trained model
-        """
         print(f"\nTraining PPO (seed={seed})...")
-
-        # Create environment
-        env = self.create_env(self.train_data)
-
-        # Get hyperparameters
-        ppo_config = self.config["models"]["ppo"]
-        training_config = self.config["training"]
-
-        # Create model
-        model = PPO(
-            "MlpPolicy",
-            env,
-            learning_rate=ppo_config["learning_rate"],
-            n_steps=ppo_config["n_steps"],
-            batch_size=ppo_config["batch_size"],
-            n_epochs=ppo_config["n_epochs"],
-            gamma=0.99,
-            gae_lambda=ppo_config["gae_lambda"],
-            clip_range=ppo_config["clip_range"],
-            ent_coef=ppo_config["ent_coef"],
-            vf_coef=ppo_config["vf_coef"],
-            max_grad_norm=ppo_config["max_grad_norm"],
-            policy_kwargs=dict(net_arch=[128, 64]),
-            verbose=0,
+        cfg = self.config["models"]["ppo"]
+        return self._sb3_train(
+            PPO,
+            dict(
+                learning_rate=cfg["learning_rate"],
+                n_steps=cfg["n_steps"],
+                batch_size=cfg["batch_size"],
+                n_epochs=cfg["n_epochs"],
+                gamma=0.99,
+                gae_lambda=cfg["gae_lambda"],
+                clip_range=cfg["clip_range"],
+                ent_coef=cfg["ent_coef"],
+                vf_coef=cfg["vf_coef"],
+                max_grad_norm=cfg["max_grad_norm"],
+            ),
+            name="ppo",
             seed=seed,
         )
-
-        # Train
-        model.learn(
-            total_timesteps=training_config["total_timesteps"],
-            log_interval=training_config["log_interval"],
-        )
-
-        # Save model
-        model_path = os.path.join(self.models_dir, f"ppo_seed_{seed}")
-        model.save(model_path)
-
-        return model
 
     def train_ddpg(self, seed: int = 0):
-        """
-        Train DDPG agent.
-
-        Args:
-            seed: Random seed
-
-        Returns:
-            Trained model
-        """
         print(f"\nTraining DDPG (seed={seed})...")
-
-        # Create environment
-        env = self.create_env(self.train_data)
-
-        # Get hyperparameters
-        ddpg_config = self.config["models"]["ddpg"]
-        training_config = self.config["training"]
-
-        # Create model
-        model = DDPG(
-            "MlpPolicy",
-            env,
-            learning_rate=ddpg_config["learning_rate_actor"],
-            buffer_size=ddpg_config["buffer_size"],
-            batch_size=ddpg_config["batch_size"],
-            tau=ddpg_config["tau"],
-            gamma=ddpg_config["gamma"],
-            policy_kwargs=dict(net_arch=[128, 64]),
-            verbose=0,
+        cfg = self.config["models"]["ddpg"]
+        return self._sb3_train(
+            DDPG,
+            dict(
+                learning_rate=cfg["learning_rate_actor"],
+                buffer_size=cfg["buffer_size"],
+                batch_size=cfg["batch_size"],
+                tau=cfg["tau"],
+                gamma=cfg["gamma"],
+            ),
+            name="ddpg",
             seed=seed,
         )
-
-        # Train
-        model.learn(
-            total_timesteps=training_config["total_timesteps"],
-            log_interval=training_config["log_interval"],
-        )
-
-        # Save model
-        model_path = os.path.join(self.models_dir, f"ddpg_seed_{seed}")
-        model.save(model_path)
-
-        return model
 
     def train_sac(self, seed: int = 0):
-        """
-        Train SAC agent.
-
-        Args:
-            seed: Random seed
-
-        Returns:
-            Trained model
-        """
         print(f"\nTraining SAC (seed={seed})...")
-
-        # Create environment
-        env = self.create_env(self.train_data)
-
-        # Get hyperparameters
-        sac_config = self.config["models"]["sac"]
-        training_config = self.config["training"]
-
-        # Create model
-        model = SAC(
-            "MlpPolicy",
-            env,
-            learning_rate=sac_config["learning_rate"],
-            buffer_size=sac_config["buffer_size"],
-            batch_size=sac_config["batch_size"],
-            tau=sac_config["tau"],
-            gamma=sac_config["gamma"],
-            ent_coef=sac_config["ent_coef"],
-            policy_kwargs=dict(net_arch=[128, 64]),
-            verbose=0,
+        cfg = self.config["models"]["sac"]
+        return self._sb3_train(
+            SAC,
+            dict(
+                learning_rate=cfg["learning_rate"],
+                buffer_size=cfg["buffer_size"],
+                batch_size=cfg["batch_size"],
+                tau=cfg["tau"],
+                gamma=cfg["gamma"],
+                ent_coef=cfg["ent_coef"],
+            ),
+            name="sac",
             seed=seed,
         )
 
-        # Train
-        model.learn(
-            total_timesteps=training_config["total_timesteps"],
-            log_interval=training_config["log_interval"],
-        )
+    # ------------------------------------------------------------------ #
+    # QR-DDPG training                                                      #
+    # ------------------------------------------------------------------ #
 
-        # Save model
-        model_path = os.path.join(self.models_dir, f"sac_seed_{seed}")
-        model.save(model_path)
-
-        return model
-
-    def train_qr_ddpg(self, seed: int = 0):
-        """
-        Train QR-DDPG agent.
-
-        Args:
-            seed: Random seed
-
-        Returns:
-            Trained agent
-        """
+    def train_qr_ddpg(self, seed: int = 0) -> QRDDPGAgent:
         print(f"\nTraining QR-DDPG (seed={seed})...")
 
-        # Set seeds
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        # Create environment
-        env = self.create_env(self.train_data).envs[0]
+        # Use the raw env — QRDDPGAgent is not SB3-compatible
+        env = self._make_raw_env(self.train_data)
+        cfg = self.config["models"]["qr_ddpg"]
+        train_cfg = self.config["training"]
 
-        # Get hyperparameters
-        qr_ddpg_config = self.config["models"]["qr_ddpg"]
-        training_config = self.config["training"]
-
-        # Get state and action dimensions
         state_dim = env.observation_space.shape[0]
         action_dim = env.action_space.shape[0]
-
-        # Create agent
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
         agent = QRDDPGAgent(
             state_dim=state_dim,
             action_dim=action_dim,
-            lr_actor=qr_ddpg_config["learning_rate_actor"],
-            lr_critic=qr_ddpg_config["learning_rate_critic"],
-            gamma=qr_ddpg_config["gamma"],
-            tau=qr_ddpg_config["tau"],
-            n_quantiles=qr_ddpg_config["n_quantiles"],
-            buffer_size=qr_ddpg_config["buffer_size"],
+            lr_actor=cfg["learning_rate_actor"],
+            lr_critic=cfg["learning_rate_critic"],
+            gamma=cfg["gamma"],
+            tau=cfg["tau"],
+            n_quantiles=cfg["n_quantiles"],
+            buffer_size=cfg["buffer_size"],
             device=device,
         )
 
-        # Training loop
-        total_timesteps = training_config["total_timesteps"]
-        batch_size = qr_ddpg_config["batch_size"]
+        total_steps = train_cfg["total_timesteps"]
+        batch_size = cfg["batch_size"]
 
-        state = env.reset()
-        episode_reward = 0
-        episode_count = 0
+        obs, _ = env.reset()
+        ep_reward = 0.0
+        ep_count = 0
 
-        for step in range(total_timesteps):
-            # Select action
-            action = agent.select_action(state, noise=0.1)
+        for step in range(total_steps):
+            action = agent.select_action(obs, noise=0.1)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
 
-            # Take step
-            next_state, reward, done, info = env.step(action)
+            agent.replay_buffer.push(obs, action, reward, next_obs, float(done))
 
-            # Store transition
-            agent.replay_buffer.push(state, action, reward, next_state, done)
-
-            # Update agent
             if len(agent.replay_buffer) > batch_size:
                 agent.update(batch_size)
 
-            episode_reward += reward
-            state = next_state
+            ep_reward += reward
+            obs = next_obs
 
             if done:
-                episode_count += 1
-                if episode_count % 10 == 0:
-                    print(f"Episode {episode_count}, Reward: {episode_reward:.2f}")
+                ep_count += 1
+                if ep_count % 10 == 0:
+                    print(f"  Episode {ep_count:4d} | Reward: {ep_reward:10.2f}")
+                obs, _ = env.reset()
+                ep_reward = 0.0
 
-                state = env.reset()
-                episode_reward = 0
-
-        # Save agent
-        model_path = os.path.join(self.models_dir, f"qr_ddpg_seed_{seed}.pt")
+        # Save weights
+        save_path = self.models_dir / f"qr_ddpg_seed_{seed}.pt"
         torch.save(
             {
                 "actor_state_dict": agent.actor.state_dict(),
                 "critic_state_dict": agent.critic.state_dict(),
             },
-            model_path,
+            save_path,
         )
-
         return agent
+
+    # ------------------------------------------------------------------ #
+    # Evaluation                                                            #
+    # ------------------------------------------------------------------ #
 
     def evaluate_agent(self, model, agent_type: str = "sb3"):
         """
-        Evaluate trained agent on test data.
+        Evaluate a trained agent on the held-out test data.
 
-        Args:
-            model: Trained model or agent
-            agent_type: 'sb3' for Stable-Baselines3, 'custom' for custom agents
-
-        Returns:
-            Dictionary with evaluation results
+        Fix: both sb3 and custom agents now receive the *unwrapped*
+        PortfolioEnv, preventing the shape mismatch that occurred when the
+        original code passed DummyVecEnv output to QRDDPGAgent.select_action.
         """
-        # Create test environment
-        env = self.create_env(self.test_data, is_training=False)
-
-        if agent_type == "sb3":
-            env_unwrapped = env.envs[0]
-        else:
-            env_unwrapped = env
-
-        # Run evaluation
-        state = env_unwrapped.reset()
+        # Always use the raw (unwrapped) env for evaluation
+        env = self._make_raw_env(self.test_data)
+        obs, _ = env.reset()
         done = False
 
         while not done:
             if agent_type == "sb3":
-                action, _ = model.predict(state, deterministic=True)
+                # model.predict expects (n_envs, obs_dim); add batch dim
+                action, _ = model.predict(obs[np.newaxis], deterministic=True)
+                action = action[0]  # remove batch dim
             else:
-                action = model.select_action(state, noise=0.0)
+                action = model.select_action(obs, noise=0.0)
 
-            state, reward, done, info = env_unwrapped.step(action)
+            obs, _, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
 
-        # Get metrics
-        metrics = env_unwrapped.get_portfolio_metrics()
-        portfolio_df = env_unwrapped.save_portfolio_values()
-
+        metrics = env.get_portfolio_metrics()
+        portfolio_df = env.save_portfolio_values()
         return metrics, portfolio_df
 
-    def train_all_agents(self, n_seeds: int = None):
-        """
-        Train all agents with multiple seeds.
+    # ------------------------------------------------------------------ #
+    # Full training run                                                     #
+    # ------------------------------------------------------------------ #
 
-        Args:
-            n_seeds: Number of random seeds (if None, use config value)
-        """
+    def train_all_agents(self, n_seeds: int | None = None) -> dict:
         if n_seeds is None:
             n_seeds = self.config["training"]["n_seeds"]
 
@@ -370,60 +290,46 @@ class TrainDRLAgents:
         print("STEP 2: Training DRL Agents")
         print("=" * 50)
 
-        results = {"ppo": [], "ddpg": [], "sac": [], "qr_ddpg": []}
+        results: dict = {"ppo": [], "ddpg": [], "sac": [], "qr_ddpg": []}
 
         for seed in range(n_seeds):
-            print(f"\n--- Training with seed {seed} ---")
+            print(f"\n--- Seed {seed} ---")
 
-            # Train PPO
             ppo_model = self.train_ppo(seed)
-            ppo_metrics, _ = self.evaluate_agent(ppo_model, "sb3")
-            results["ppo"].append(ppo_metrics)
+            results["ppo"].append(self.evaluate_agent(ppo_model, "sb3")[0])
 
-            # Train DDPG
             ddpg_model = self.train_ddpg(seed)
-            ddpg_metrics, _ = self.evaluate_agent(ddpg_model, "sb3")
-            results["ddpg"].append(ddpg_metrics)
+            results["ddpg"].append(self.evaluate_agent(ddpg_model, "sb3")[0])
 
-            # Train SAC
             sac_model = self.train_sac(seed)
-            sac_metrics, _ = self.evaluate_agent(sac_model, "sb3")
-            results["sac"].append(sac_metrics)
+            results["sac"].append(self.evaluate_agent(sac_model, "sb3")[0])
 
-            # Train QR-DDPG
-            qr_ddpg_agent = self.train_qr_ddpg(seed)
-            qr_ddpg_metrics, _ = self.evaluate_agent(qr_ddpg_agent, "custom")
-            results["qr_ddpg"].append(qr_ddpg_metrics)
+            qr_agent = self.train_qr_ddpg(seed)
+            results["qr_ddpg"].append(self.evaluate_agent(qr_agent, "custom")[0])
 
-            print(f"\nSeed {seed} completed")
+            print(f"Seed {seed} completed")
 
-        # Save results
-        self.save_results(results)
-
+        self._save_results(results)
         return results
 
-    def save_results(self, results: dict):
-        """Save training results to CSV."""
-        results_list = []
+    # ------------------------------------------------------------------ #
+    # Persistence                                                           #
+    # ------------------------------------------------------------------ #
 
+    def _save_results(self, results: dict) -> None:
+        rows = []
         for agent_name, metrics_list in results.items():
             for seed, metrics in enumerate(metrics_list):
                 row = {"agent": agent_name, "seed": seed}
                 row.update(metrics)
-                results_list.append(row)
+                rows.append(row)
 
-        results_df = pd.DataFrame(results_list)
-        results_path = os.path.join(self.results_dir, "training_results.csv")
-        results_df.to_csv(results_path, index=False)
+        df = pd.DataFrame(rows)
+        out = self.results_dir / "training_results.csv"
+        df.to_csv(out, index=False)
+        print(f"\nResults saved to: {out}")
 
-        print(f"\nResults saved to: {results_path}")
-
-        # Print summary
-        print("\n" + "=" * 50)
-        print("TRAINING SUMMARY")
-        print("=" * 50)
-
-        summary = results_df.groupby("agent").agg(
+        summary = df.groupby("agent").agg(
             {
                 "annual_return": ["mean", "std"],
                 "sharpe_ratio": ["mean", "std"],
@@ -431,20 +337,19 @@ class TrainDRLAgents:
                 "sortino_ratio": ["mean", "std"],
             }
         )
-
+        print("\n" + "=" * 50)
+        print("TRAINING SUMMARY")
+        print("=" * 50)
         print(summary)
 
 
-def main():
-    """Main training function."""
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
     trainer = TrainDRLAgents()
-
-    # Prepare data
     trainer.prepare_data()
-
-    # Train all agents (use 2 seeds for quick demo, set to 10 for full training)
-    results = trainer.train_all_agents(n_seeds=2)
-
+    trainer.train_all_agents(n_seeds=2)
     print("\nTraining completed successfully!")
 
 

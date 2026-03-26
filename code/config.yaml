@@ -1,0 +1,264 @@
+# Enhanced Configuration for RL Portfolio Optimization
+# Fixes applied:
+#   - total_timesteps raised from 100_000 to 500_000 (minimum for convergence)
+#   - n_seeds reduced from 10 to 3 (practical default; set back to 10 for papers)
+#   - ^VIX moved out of investable assets into macro_factors (it cannot be held)
+#   - production.api.allowed_origins added (replaces the open "*" CORS policy)
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  start_date: "2015-01-01"
+  end_date: "2024-12-31"
+  train_start: "2015-01-01"
+  train_end: "2022-12-31"
+  test_start: "2023-01-01"
+  test_end: "2024-12-31"
+
+  # Investable asset universe (25 assets, 4 classes)
+  # NOTE: ^VIX is NOT listed here — it is not a tradeable instrument.
+  assets:
+    equities:
+      - AAPL # Apple
+      - MSFT # Microsoft
+      - GOOGL # Alphabet
+      - AMZN # Amazon
+      - TSLA # Tesla
+      - JPM # JP Morgan
+      - V # Visa
+      - JNJ # Johnson & Johnson
+      - WMT # Walmart
+      - PG # Procter & Gamble
+
+    cryptocurrencies:
+      - BTC-USD # Bitcoin
+      - ETH-USD # Ethereum
+      - BNB-USD # Binance Coin
+      - ADA-USD # Cardano
+      - XRP-USD # Ripple
+
+    commodities:
+      - GC=F # Gold Futures
+      - SI=F # Silver Futures
+      - CL=F # Crude Oil Futures
+      - NG=F # Natural Gas Futures
+      - HG=F # Copper Futures
+
+    fixed_income:
+      - TLT # 20+ Year Treasury Bond ETF
+      - IEF # 7-10 Year Treasury Bond ETF
+      - SHY # 1-3 Year Treasury Bond ETF
+      - LQD # Investment Grade Corporate Bond ETF
+      - HYG # High Yield Corporate Bond ETF
+
+  # Technical indicators computed by DataProcessor
+  technical_indicators:
+    - macd
+    - rsi
+    - cci
+    - dx
+    - boll_ub
+    - boll_lb
+
+  # Macroeconomic factors — downloaded for state features / turbulence
+  # but EXCLUDED from the portfolio weight vector (not tradeable).
+  macro_factors:
+    - ^VIX # CBOE Volatility Index
+
+# ── Environment ───────────────────────────────────────────────────────────────
+environment:
+  initial_amount: 1000000
+  transaction_cost_pct: 0.001 # 0.1% one-way
+  slippage_coefficient: 0.05
+  reward_scaling: 1.0
+  hmax: 0.30 # max weight per asset (fraction, e.g. 0.30 = 30%)
+  print_verbosity: 50
+
+# ── Transaction Cost Analysis ─────────────────────────────────────────────────
+transaction_costs:
+  enabled: true
+  cost_structures:
+    retail: 0.005 # 0.5%
+    standard: 0.001 # 0.1%
+    institutional: 0.0005 # 0.05%
+    zero: 0.0 # baseline comparison
+  rebalance_frequencies:
+    daily: 1
+    weekly: 5
+    biweekly: 10
+    monthly: 20
+    quarterly: 60
+  analysis_output: "./results/transaction_cost_analysis"
+
+# ── Market Constraints ────────────────────────────────────────────────────────
+constraints:
+  enabled: true
+  short_selling: false
+  max_leverage: 1.0
+  max_position_size: 0.30
+  min_position_size: 0.0
+  sector_exposure_limits:
+    equities: 0.60
+    cryptocurrencies: 0.30
+    commodities: 0.30
+    fixed_income: 0.50
+
+# ── Reward Ablation Study ─────────────────────────────────────────────────────
+reward_ablation:
+  enabled: true
+  lambda_values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  n_seeds: 3
+  output_dir: "./results/reward_ablation"
+
+# ── Market Regime Analysis ────────────────────────────────────────────────────
+regime_analysis:
+  enabled: true
+  methods:
+    - volatility # VIX-based
+    - trend # MA crossover
+    - returns # rolling return clustering
+  regime_definitions:
+    bull:
+      vix_threshold: 20
+      return_threshold: 0.15
+    bear:
+      vix_threshold: 30
+      return_threshold: -0.10
+    sideways:
+      vix_range: [15, 25]
+      return_range: [-0.05, 0.10]
+  output_dir: "./results/regime_analysis"
+
+# ── Risk Management ───────────────────────────────────────────────────────────
+risk:
+  max_drawdown_penalty: 0.5
+  risk_free_rate: 0.045
+  cvar_alpha: 0.05
+  var_alpha: 0.05
+
+# ── Model Hyperparameters ─────────────────────────────────────────────────────
+models:
+  ppo:
+    n_steps: 2048
+    batch_size: 256
+    learning_rate: 0.0003
+    ent_coef: 0.01
+    clip_range: 0.2
+    n_epochs: 10
+    gae_lambda: 0.95
+    max_grad_norm: 0.5
+    vf_coef: 0.5
+    policy_kwargs:
+      net_arch: [128, 64]
+      activation_fn: relu
+
+  qr_ddpg:
+    learning_rate_actor: 0.0001
+    learning_rate_critic: 0.0003
+    batch_size: 128
+    buffer_size: 1000000
+    tau: 0.005
+    gamma: 0.99
+    n_quantiles: 50
+    policy_kwargs:
+      net_arch: [128, 64]
+
+  ddpg:
+    learning_rate_actor: 0.0001
+    learning_rate_critic: 0.0003
+    batch_size: 128
+    buffer_size: 1000000
+    tau: 0.005
+    gamma: 0.99
+    policy_kwargs:
+      net_arch: [128, 64]
+
+  sac:
+    learning_rate: 0.0003
+    batch_size: 256
+    buffer_size: 1000000
+    tau: 0.005
+    gamma: 0.99
+    ent_coef: 0.2
+    policy_kwargs:
+      net_arch: [128, 64]
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  # 100_000 is too low to converge with 25 assets.
+  # 500_000 is a practical minimum; use 1_000_000+ for research-quality runs.
+  total_timesteps: 500000
+  n_eval_episodes: 10
+  eval_freq: 5000
+  # Reduced from 10 to 3 for practical runtime.
+  # Set to 10 for full statistical robustness (papers / final evaluation).
+  n_seeds: 3
+  log_interval: 100
+  save_freq: 10000
+
+# ── Benchmark Strategies ──────────────────────────────────────────────────────
+benchmarks:
+  - equal_weight
+  - mvo
+  - risk_parity
+  - minimum_volatility
+  - momentum
+  - sixty_forty
+  - all_weather
+  - minimum_correlation
+
+# ── Production ────────────────────────────────────────────────────────────────
+production:
+  api:
+    host: "0.0.0.0"
+    port: 8000
+    workers: 4
+    reload: false
+    log_level: info
+    # Explicit CORS allowlist — replaces the insecure allow_origins="*"
+    # Add your frontend origin(s) here.
+    allowed_origins:
+      - "http://localhost"
+      - "http://localhost:3000"
+      # - "https://your-production-domain.com"
+
+  database:
+    host: localhost
+    port: 5432
+    name: portfolio_db
+    user: portfolio_user
+
+  redis:
+    host: localhost
+    port: 6379
+    db: 0
+
+  monitoring:
+    enabled: true
+    prometheus_port: 9090
+    grafana_port: 3000
+
+  rebalancing:
+    frequency: weekly # daily | weekly | monthly
+    time: "09:30"
+    timezone: US/Eastern
+
+  risk_monitoring:
+    max_drawdown_alert: 0.15
+    var_limit: 0.05
+    position_limit_alert: 0.35
+
+  reporting:
+    daily_report: true
+    weekly_report: true
+    monthly_report: true
+    client_reports_enabled: true
+    report_recipients:
+      - "portfolio@example.com"
+
+# ── Output Paths ──────────────────────────────────────────────────────────────
+output:
+  results_dir: "./results"
+  models_dir: "./models"
+  figures_dir: "./results/figures"
+  logs_dir: "./results/logs"
+  reports_dir: "./results/reports"

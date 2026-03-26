@@ -1,224 +1,277 @@
 """
 Data preprocessing and feature engineering module.
-
-This module handles:
-1. Data fetching from Yahoo Finance
-2. Technical indicator calculation
-3. Feature engineering for the RL environment
-4. Data cleaning and normalization
 """
 
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from typing import Dict, Tuple
+from __future__ import annotations
+
 import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
+_ROOT = Path(__file__).resolve().parent.parent
+
 
 class DataProcessor:
-    """Process financial data for RL training."""
+    """Download, clean, and feature-engineer financial data for RL training."""
 
-    def __init__(self, config: Dict):
-        """
-        Initialize DataProcessor.
-
-        Args:
-            config: Configuration dictionary with data parameters
-        """
+    def __init__(self, config: Dict) -> None:
         self.config = config
-        self.data = None
-        self.processed_data = None
+        self.data: Optional[pd.DataFrame] = None
+        self.processed_data: Optional[pd.DataFrame] = None
+        self.valid_tickers: List[str] = []  # tickers with sufficient data
+
+    # ------------------------------------------------------------------ #
+    # Step 1 – Data fetching                                               #
+    # ------------------------------------------------------------------ #
 
     def fetch_data(self) -> pd.DataFrame:
         """
-        Fetch historical data for all assets.
+        Fetch OHLCV data for all configured assets in a single batch call.
 
-        Returns:
-            DataFrame with OHLCV data for all assets
+        Returns
+        -------
+        pd.DataFrame
+            Long-format DataFrame with columns: Date, Open, High, Low,
+            Close, Volume, tic.
         """
-        print("Fetching data from Yahoo Finance...")
+        print("Fetching data from Yahoo Finance (batch download)...")
 
-        # Combine all asset tickers
-        all_assets = []
+        all_assets: List[str] = []
         for asset_class in [
             "equities",
             "cryptocurrencies",
             "commodities",
             "fixed_income",
         ]:
-            all_assets.extend(self.config["data"]["assets"][asset_class])
+            all_assets.extend(self.config["data"]["assets"].get(asset_class, []))
 
-        # Add macro factors
-        all_assets.extend(self.config["data"]["macro_factors"])
+        # Macro factors are downloaded separately and NOT included in the
+        # investable universe (e.g. ^VIX cannot be traded).
+        macro_factors: List[str] = self.config["data"].get("macro_factors", [])
 
         start_date = self.config["data"]["start_date"]
         end_date = self.config["data"]["end_date"]
 
-        # Download data
-        data_dict = {}
+        # ---- Batch download for investable assets -------------------------- #
+        raw = yf.download(
+            all_assets,
+            start=start_date,
+            end=end_date,
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+
+        data_list: List[pd.DataFrame] = []
+        failed: List[str] = []
+
         for ticker in all_assets:
             try:
-                print(f"Downloading {ticker}...")
-                df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                if not df.empty:
-                    df["tic"] = ticker
-                    data_dict[ticker] = df
+                if len(all_assets) == 1:
+                    df_t = raw.copy()
                 else:
-                    print(f"Warning: No data for {ticker}")
-            except Exception as e:
-                print(f"Error downloading {ticker}: {e}")
+                    df_t = raw[ticker].copy()
 
-        # Combine all data
-        data_list = []
-        for ticker, df in data_dict.items():
-            df = df.reset_index()
-            df["tic"] = ticker
-            data_list.append(df)
+                df_t = df_t.dropna(subset=["Close"])
 
-        self.data = pd.concat(data_list, ignore_index=True)
-        self.data = self.data.sort_values(["Date", "tic"]).reset_index(drop=True)
+                if len(df_t) < 30:
+                    print(f"  [SKIP] {ticker}: insufficient data ({len(df_t)} rows)")
+                    failed.append(ticker)
+                    continue
+
+                df_t = df_t.reset_index()
+                df_t["tic"] = ticker
+                data_list.append(
+                    df_t[["Date", "Open", "High", "Low", "Close", "Volume", "tic"]]
+                )
+
+            except Exception as exc:
+                print(f"  [SKIP] {ticker}: {exc}")
+                failed.append(ticker)
+
+        if failed:
+            print(f"  Dropped {len(failed)} ticker(s): {failed}")
+
+        self.valid_tickers = [t for t in all_assets if t not in failed]
+
+        # ---- Macro factors (separate download, not in portfolio) ----------- #
+        if macro_factors:
+            macro_raw = yf.download(
+                macro_factors,
+                start=start_date,
+                end=end_date,
+                group_by="ticker",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+            for ticker in macro_factors:
+                try:
+                    df_t = (
+                        macro_raw[ticker] if len(macro_factors) > 1 else macro_raw
+                    ).copy()
+                    df_t = df_t.dropna(subset=["Close"]).reset_index()
+                    df_t["tic"] = ticker
+                    data_list.append(
+                        df_t[["Date", "Open", "High", "Low", "Close", "Volume", "tic"]]
+                    )
+                    self.valid_tickers.append(ticker)
+                except Exception as exc:
+                    print(f"  [SKIP macro] {ticker}: {exc}")
+
+        self.data = (
+            pd.concat(data_list, ignore_index=True)
+            .sort_values(["Date", "tic"])
+            .reset_index(drop=True)
+        )
+        self.data["Date"] = pd.to_datetime(self.data["Date"])
 
         print(
-            f"Data fetched: {len(self.data)} rows, {self.data['tic'].nunique()} tickers"
+            f"Data fetched: {len(self.data):,} rows, "
+            f"{self.data['tic'].nunique()} tickers"
         )
         return self.data
 
-    def calculate_technical_indicators(self) -> pd.DataFrame:
-        """
-        Calculate technical indicators for each asset.
+    # ------------------------------------------------------------------ #
+    # Step 2 – Technical indicators                                         #
+    # ------------------------------------------------------------------ #
 
-        Returns:
-            DataFrame with technical indicators
-        """
+    def calculate_technical_indicators(self) -> pd.DataFrame:
+        """Compute MACD, RSI, CCI, DX, and Bollinger Bands for every ticker."""
         print("Calculating technical indicators...")
 
-        df = self.data.copy()
-        unique_tickers = df["tic"].unique()
+        processed_list: List[pd.DataFrame] = []
 
-        processed_list = []
-        for ticker in unique_tickers:
-            ticker_df = df[df["tic"] == ticker].copy()
+        for ticker in self.data["tic"].unique():
+            t = self.data[self.data["tic"] == ticker].copy().sort_values("Date")
 
             # MACD
-            exp1 = ticker_df["Close"].ewm(span=12, adjust=False).mean()
-            exp2 = ticker_df["Close"].ewm(span=26, adjust=False).mean()
-            ticker_df["macd"] = exp1 - exp2
-            ticker_df["macd_signal"] = (
-                ticker_df["macd"].ewm(span=9, adjust=False).mean()
-            )
-            ticker_df["macd_diff"] = ticker_df["macd"] - ticker_df["macd_signal"]
+            exp1 = t["Close"].ewm(span=12, adjust=False).mean()
+            exp2 = t["Close"].ewm(span=26, adjust=False).mean()
+            t["macd"] = exp1 - exp2
+            t["macd_signal"] = t["macd"].ewm(span=9, adjust=False).mean()
+            t["macd_diff"] = t["macd"] - t["macd_signal"]
 
             # RSI
-            delta = ticker_df["Close"].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            ticker_df["rsi"] = 100 - (100 / (1 + rs))
+            delta = t["Close"].diff()
+            gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+            rs = gain / loss.replace(0, np.nan)
+            t["rsi"] = 100 - (100 / (1 + rs))
 
-            # CCI (Commodity Channel Index)
-            tp = (ticker_df["High"] + ticker_df["Low"] + ticker_df["Close"]) / 3
-            sma = tp.rolling(window=20).mean()
-            mad = tp.rolling(window=20).apply(lambda x: np.abs(x - x.mean()).mean())
-            ticker_df["cci"] = (tp - sma) / (0.015 * mad)
+            # CCI
+            tp = (t["High"] + t["Low"] + t["Close"]) / 3
+            sma = tp.rolling(20).mean()
+            mad = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+            t["cci"] = (tp - sma) / (0.015 * mad.replace(0, np.nan))
 
-            # DX (Directional Index)
-            high_diff = ticker_df["High"].diff()
-            low_diff = -ticker_df["Low"].diff()
+            # DX
+            h_diff = t["High"].diff()
+            l_diff = -t["Low"].diff()
+            pos_dm = h_diff.where((h_diff > l_diff) & (h_diff > 0), 0.0)
+            neg_dm = l_diff.where((l_diff > h_diff) & (l_diff > 0), 0.0)
 
-            pos_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
-            neg_dm = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
-
-            tr1 = ticker_df["High"] - ticker_df["Low"]
-            tr2 = abs(ticker_df["High"] - ticker_df["Close"].shift())
-            tr3 = abs(ticker_df["Low"] - ticker_df["Close"].shift())
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-            atr = tr.rolling(window=14).mean()
-            pos_di = 100 * (pos_dm.rolling(window=14).mean() / atr)
-            neg_di = 100 * (neg_dm.rolling(window=14).mean() / atr)
-
-            ticker_df["dx"] = 100 * abs(pos_di - neg_di) / (pos_di + neg_di)
+            tr = pd.concat(
+                [
+                    t["High"] - t["Low"],
+                    (t["High"] - t["Close"].shift()).abs(),
+                    (t["Low"] - t["Close"].shift()).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            atr = tr.rolling(14).mean().replace(0, np.nan)
+            pos_di = 100 * pos_dm.rolling(14).mean() / atr
+            neg_di = 100 * neg_dm.rolling(14).mean() / atr
+            di_sum = (pos_di + neg_di).replace(0, np.nan)
+            t["dx"] = 100 * (pos_di - neg_di).abs() / di_sum
 
             # Bollinger Bands
-            sma_20 = ticker_df["Close"].rolling(window=20).mean()
-            std_20 = ticker_df["Close"].rolling(window=20).std()
-            ticker_df["boll_ub"] = sma_20 + 2 * std_20
-            ticker_df["boll_lb"] = sma_20 - 2 * std_20
+            sma20 = t["Close"].rolling(20).mean()
+            std20 = t["Close"].rolling(20).std()
+            t["boll_ub"] = sma20 + 2 * std20
+            t["boll_lb"] = sma20 - 2 * std20
 
-            processed_list.append(ticker_df)
+            processed_list.append(t)
 
-        self.processed_data = pd.concat(processed_list, ignore_index=True)
-        self.processed_data = self.processed_data.sort_values(
-            ["Date", "tic"]
-        ).reset_index(drop=True)
-
-        # Forward fill and backward fill NaN values
-        self.processed_data = self.processed_data.fillna(method="ffill").fillna(
-            method="bfill"
+        self.processed_data = (
+            pd.concat(processed_list, ignore_index=True)
+            .sort_values(["Date", "tic"])
+            .reset_index(drop=True)
+            # Fix: .ffill().bfill() replaces deprecated fillna(method=)
+            .ffill()
+            .bfill()
         )
 
         print("Technical indicators calculated successfully")
         return self.processed_data
 
+    # ------------------------------------------------------------------ #
+    # Step 3 – Turbulence index (look-ahead-free)                          #
+    # ------------------------------------------------------------------ #
+
     def add_turbulence_index(self) -> pd.DataFrame:
         """
-        Add market turbulence index to the data.
+        Compute the Mahalanobis-distance turbulence index.
 
-        Returns:
-            DataFrame with turbulence index
+        Fix: uses an *expanding* covariance matrix computed only on data
+        up to (but not including) the current date, removing the look-ahead
+        bias present in the original implementation.
+
+        A minimum warmup of 60 trading days is required before the
+        Mahalanobis distance can be estimated; earlier rows receive 0.
         """
-        print("Calculating turbulence index...")
+        print("Calculating turbulence index (expanding window, no look-ahead)...")
 
         df = self.processed_data.copy()
-
-        # Calculate returns
         df["returns"] = df.groupby("tic")["Close"].pct_change()
 
-        # Pivot returns to have tickers as columns
-        returns_pivot = df.pivot(index="Date", columns="tic", values="returns")
+        returns_pivot = df.pivot_table(
+            index="Date", columns="tic", values="returns", aggfunc="first"
+        ).fillna(0.0)
 
-        # Calculate covariance matrix
-        cov_matrix = returns_pivot.cov()
+        dates = returns_pivot.index.tolist()
+        warmup = 60
+        turb_list = []
 
-        # Calculate turbulence for each date
-        turbulence_list = []
-        for date in returns_pivot.index:
-            current_returns = returns_pivot.loc[date].values
-            current_returns = current_returns[~np.isnan(current_returns)]
+        for i, date in enumerate(dates):
+            if i < warmup:
+                turb_list.append({"Date": date, "turbulence": 0.0})
+                continue
 
-            if len(current_returns) > 0:
-                # Mahalanobis distance
-                try:
-                    diff = (
-                        current_returns
-                        - returns_pivot.mean().values[: len(current_returns)]
-                    )
-                    turbulence = np.dot(
-                        np.dot(diff.T, np.linalg.pinv(cov_matrix)), diff
-                    )
-                except:
-                    turbulence = 0
-            else:
-                turbulence = 0
+            # Only look at history BEFORE current date (expanding, no leakage)
+            hist = returns_pivot.iloc[:i]
+            hist_mean = hist.mean()
+            hist_cov = hist.cov()
 
-            turbulence_list.append({"Date": date, "turbulence": turbulence})
+            curr = returns_pivot.iloc[i].values
 
-        turbulence_df = pd.DataFrame(turbulence_list)
-        df = df.merge(turbulence_df, on="Date", how="left")
+            try:
+                diff = curr - hist_mean.values
+                inv_cov = np.linalg.pinv(hist_cov.values)
+                turb = float(diff @ inv_cov @ diff)
+            except Exception:
+                turb = 0.0
 
-        self.processed_data = df
-        print("Turbulence index calculated successfully")
+            turb_list.append({"Date": date, "turbulence": turb})
+
+        turb_df = pd.DataFrame(turb_list)
+        self.processed_data = df.merge(turb_df, on="Date", how="left")
+
+        print("Turbulence index calculated (expanding window)")
         return self.processed_data
 
-    def split_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Split data into train and test sets.
+    # ------------------------------------------------------------------ #
+    # Step 4 – Train / test split                                          #
+    # ------------------------------------------------------------------ #
 
-        Returns:
-            Tuple of (train_data, test_data)
-        """
+    def split_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         train_start = pd.to_datetime(self.config["data"]["train_start"])
         train_end = pd.to_datetime(self.config["data"]["train_end"])
         test_start = pd.to_datetime(self.config["data"]["test_start"])
@@ -227,34 +280,47 @@ class DataProcessor:
         df = self.processed_data.copy()
         df["Date"] = pd.to_datetime(df["Date"])
 
-        train_data = df[(df["Date"] >= train_start) & (df["Date"] <= train_end)]
-        test_data = df[(df["Date"] >= test_start) & (df["Date"] <= test_end)]
+        # Keep only investable tickers (exclude macro-only factors from the
+        # portfolio universe if they cannot be held as positions)
+        investable = [
+            t
+            for t in self.valid_tickers
+            if t not in self.config["data"].get("macro_factors", [])
+        ]
+        df = df[df["tic"].isin(investable)]
 
-        print(f"Train data: {train_data['Date'].min()} to {train_data['Date'].max()}")
-        print(f"Test data: {test_data['Date'].min()} to {test_data['Date'].max()}")
+        train = df[(df["Date"] >= train_start) & (df["Date"] <= train_end)].copy()
+        test = df[(df["Date"] >= test_start) & (df["Date"] <= test_end)].copy()
 
-        return train_data, test_data
+        print(
+            f"Train: {train['Date'].min().date()} → {train['Date'].max().date()} "
+            f"({len(train):,} rows)"
+        )
+        print(
+            f"Test : {test['Date'].min().date()} → {test['Date'].max().date()} "
+            f"({len(test):,} rows)"
+        )
+        return train, test
+
+    # ------------------------------------------------------------------ #
+    # Orchestrator                                                          #
+    # ------------------------------------------------------------------ #
 
     def process_all(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Execute all data processing steps.
-
-        Returns:
-            Tuple of (train_data, test_data)
-        """
+        """Run all processing steps and return (train_data, test_data)."""
         self.fetch_data()
         self.calculate_technical_indicators()
         self.add_turbulence_index()
-        train_data, test_data = self.split_data()
+        return self.split_data()
 
-        return train_data, test_data
 
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Test the data processor
     import yaml
 
-    with open("../config/config.yaml", "r") as f:
+    config_path = _ROOT / "config" / "config.yaml"
+    with open(config_path) as f:
         config = yaml.safe_load(f)
 
     processor = DataProcessor(config)
@@ -262,4 +328,4 @@ if __name__ == "__main__":
 
     print("\nData processing complete!")
     print(f"Train shape: {train_data.shape}")
-    print(f"Test shape: {test_data.shape}")
+    print(f"Test shape:  {test_data.shape}")

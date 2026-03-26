@@ -1,363 +1,374 @@
 """
 Custom Portfolio Environment for RL Training.
-
-This module implements the Markov Decision Process (MDP) formulation
-with risk-aware reward function.
 """
+
+from __future__ import annotations
+
+import warnings
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import gym
-from gym import spaces
-from typing import Dict, Tuple
-import warnings
+
+import gymnasium as gym
+from gymnasium import spaces
 
 warnings.filterwarnings("ignore")
+
+TRADING_DAYS = 252
 
 
 class PortfolioEnv(gym.Env):
     """
-    Custom Environment for Portfolio Optimization.
+    Custom Gymnasium Environment for Portfolio Optimization.
 
-    State Space: Asset prices, technical indicators, macro factors,
-                 current portfolio weights, portfolio value
-    Action Space: Continuous portfolio weight changes
-    Reward: Log return - max drawdown penalty - transaction costs
+    State Space
+    -----------
+    [normalised_portfolio_value, *portfolio_weights, *per_asset_features]
+
+    Per-asset features (6 per asset): Close/100, MACD/10, RSI/100,
+    CCI/100, DX/100, BollingerUB/100.
+
+    Action Space
+    ------------
+    Continuous vector in [-1, 1]^n.  Actions are passed through softmax
+    so they represent *target portfolio weights* directly.  This is more
+    learnable than the original delta-weight scheme.
+
+    Reward
+    ------
+    log_return  -  lambda * current_drawdown  -  transaction_cost_fraction
+    Computed on every step including the terminal step.
     """
 
-    metadata = {"render.modes": ["human"]}
+    metadata = {"render_modes": ["human"]}
 
     def __init__(
         self,
         df: pd.DataFrame,
-        initial_amount: float = 1000000,
+        initial_amount: float = 1_000_000,
         transaction_cost_pct: float = 0.001,
         max_drawdown_penalty: float = 0.5,
-        hmax: int = 100,
+        hmax: float = 0.30,  # maximum weight per asset (fraction, not shares)
         print_verbosity: int = 5,
-        turbulence_threshold: float = None,
-    ):
+        turbulence_threshold: Optional[float] = None,
+    ) -> None:
         """
-        Initialize the Portfolio Environment.
-
-        Args:
-            df: Processed DataFrame with market data
-            initial_amount: Initial portfolio value
-            transaction_cost_pct: Transaction cost percentage
-            max_drawdown_penalty: Lambda coefficient for drawdown penalty
-            hmax: Maximum number of shares per trade
-            print_verbosity: How often to print progress
-            turbulence_threshold: Threshold for turbulence-based risk management
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Long-format DataFrame with columns: Date, tic, Close,
+            macd, rsi, cci, dx, boll_ub.
+        initial_amount : float
+            Starting portfolio value in USD.
+        transaction_cost_pct : float
+            One-way transaction cost applied to weight turnover.
+        max_drawdown_penalty : float
+            Lambda coefficient multiplying the drawdown term in the reward.
+        hmax : float
+            Maximum fraction of portfolio that may be allocated to any single
+            asset (e.g. 0.30 → 30 % cap).
+        print_verbosity : int
+            Print a progress line every this many steps during render().
+        turbulence_threshold : float or None
+            If set, positions are cut to cash when the turbulence index
+            exceeds this value.
         """
-        self.df = df.copy()
-        self.df = self.df.sort_values(["Date", "tic"]).reset_index(drop=True)
+        super().__init__()
 
-        self.initial_amount = initial_amount
-        self.transaction_cost_pct = transaction_cost_pct
-        self.max_drawdown_penalty = max_drawdown_penalty
-        self.hmax = hmax
+        self.df = df.copy().sort_values(["Date", "tic"]).reset_index(drop=True)
+        self.initial_amount = float(initial_amount)
+        self.transaction_cost_pct = float(transaction_cost_pct)
+        self.max_drawdown_penalty = float(max_drawdown_penalty)
+        self.hmax = float(hmax)
         self.print_verbosity = print_verbosity
         self.turbulence_threshold = turbulence_threshold
 
-        # Get unique dates and tickers
-        self.dates = self.df["Date"].unique()
-        self.tickers = self.df["tic"].unique()
+        # Sorted unique dates and tickers for reproducible indexing
+        self.dates = np.sort(self.df["Date"].unique())
+        self.tickers = np.array(sorted(self.df["tic"].unique()))
         self.n_stocks = len(self.tickers)
+        self.n_dates = len(self.dates)
 
-        # Calculate state dimension
+        # ------------------------------------------------------------------ #
+        # Pre-build price matrix  shape: (n_dates, n_stocks)                  #
+        # This replaces all per-step DataFrame filtering.                      #
+        # ------------------------------------------------------------------ #
+        self._price_matrix = self._build_price_matrix()
+        self._feature_matrix = self._build_feature_matrix()
+
+        # State: [portfolio_value_norm, *weights, *features_per_asset]
+        self._n_features_per_asset = 6  # Close, MACD, RSI, CCI, DX, BollUB
         self.state_dim = (
-            1 + self.n_stocks + self.n_stocks * 6
-        )  # portfolio value + weights + features per stock
-
-        # Action space: portfolio weight changes for each asset
-        self.action_space = spaces.Box(
-            low=-1, high=1, shape=(self.n_stocks,), dtype=np.float32
+            1  # normalised portfolio value
+            + self.n_stocks  # current weights
+            + self.n_stocks * self._n_features_per_asset  # market features
         )
 
-        # State space
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(self.n_stocks,), dtype=np.float32
+        )
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32
         )
 
-        # Initialize episode variables
-        self.current_step = 0
-        self.portfolio_value = initial_amount
-        self.initial_portfolio_value = initial_amount
-        self.portfolio_weights = np.zeros(self.n_stocks)
-        self.cash_balance = initial_amount
+        # Episode state (initialised properly in reset)
+        self.current_step: int = 0
+        self.portfolio_value: float = self.initial_amount
+        self.portfolio_weights: np.ndarray = np.zeros(self.n_stocks, dtype=np.float32)
+        self.max_portfolio_value: float = self.initial_amount
 
-        # For tracking performance
-        self.portfolio_values = [initial_amount]
-        self.portfolio_returns = [0]
-        self.max_portfolio_value = initial_amount
-        self.actions_memory = []
-        self.date_memory = [self.dates[0]]
+        self.portfolio_values: list = [self.initial_amount]
+        self.portfolio_returns: list = [0.0]
+        self.actions_memory: list = []
+        self.date_memory: list = [self.dates[0]]
 
-        print(f"Environment initialized with {self.n_stocks} assets")
-        print(f"State dimension: {self.state_dim}")
-        print(f"Action dimension: {self.n_stocks}")
+        print(f"PortfolioEnv: {self.n_stocks} assets, state_dim={self.state_dim}")
 
-    def reset(self):
-        """Reset the environment to initial state."""
+    # ------------------------------------------------------------------ #
+    # Pre-processing helpers (called once at __init__)                     #
+    # ------------------------------------------------------------------ #
+
+    def _build_price_matrix(self) -> np.ndarray:
+        """Return array of shape (n_dates, n_stocks) with Close prices."""
+        pivot = (
+            self.df.pivot(index="Date", columns="tic", values="Close")
+            .reindex(index=self.dates, columns=self.tickers)
+            .ffill()
+            .bfill()
+        )
+        return pivot.values.astype(np.float32)
+
+    def _build_feature_matrix(self) -> np.ndarray:
+        """
+        Return array of shape (n_dates, n_stocks, n_features_per_asset).
+        Features (in order): Close/100, MACD/10, RSI/100, CCI/100, DX/100, BollUB/100.
+        """
+        feature_cols = ["Close", "macd", "rsi", "cci", "dx", "boll_ub"]
+        divisors = np.array([100, 10, 100, 100, 100, 100], dtype=np.float32)
+
+        matrices = []
+        for col, div in zip(feature_cols, divisors):
+            if col in self.df.columns:
+                pivot = (
+                    self.df.pivot(index="Date", columns="tic", values=col)
+                    .reindex(index=self.dates, columns=self.tickers)
+                    .ffill()
+                    .bfill()
+                    .fillna(0.0)
+                )
+                matrices.append((pivot.values / div).astype(np.float32))
+            else:
+                matrices.append(
+                    np.zeros((self.n_dates, self.n_stocks), dtype=np.float32)
+                )
+
+        # stack → (n_dates, n_features, n_stocks) → transpose → (n_dates, n_stocks, n_features)
+        return np.stack(matrices, axis=1).transpose(0, 2, 1)
+
+    # ------------------------------------------------------------------ #
+    # Gymnasium API                                                         #
+    # ------------------------------------------------------------------ #
+
+    def reset(
+        self,
+        *,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[np.ndarray, Dict]:
+        """Reset the environment to the start of the episode."""
+        super().reset(seed=seed)
+
         self.current_step = 0
         self.portfolio_value = self.initial_amount
-        self.initial_portfolio_value = self.initial_amount
-        self.portfolio_weights = np.zeros(self.n_stocks)
-        self.cash_balance = self.initial_amount
+        self.max_portfolio_value = self.initial_amount
+        self.portfolio_weights = np.zeros(self.n_stocks, dtype=np.float32)
 
         self.portfolio_values = [self.initial_amount]
-        self.portfolio_returns = [0]
-        self.max_portfolio_value = self.initial_amount
+        self.portfolio_returns = [0.0]
         self.actions_memory = []
         self.date_memory = [self.dates[0]]
 
-        return self._get_state()
+        return self._get_state(), {}
 
-    def _get_state(self) -> np.ndarray:
+    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
-        Construct the state vector.
+        Execute one time step.
 
-        Returns:
-            State vector containing portfolio value, weights, and market features
+        Parameters
+        ----------
+        actions : np.ndarray  shape (n_stocks,)
+            Raw policy output in [-1, 1].  Converted to target weights
+            via softmax so weights are non-negative and sum to 1.
+
+        Returns
+        -------
+        obs, reward, terminated, truncated, info
         """
-        if self.current_step >= len(self.dates):
-            return np.zeros(self.state_dim)
+        terminated = self.current_step >= self.n_dates - 1
+        truncated = False
 
-        current_date = self.dates[self.current_step]
-        current_data = self.df[self.df["Date"] == current_date]
+        # ------ Convert actions → target weights (softmax projection) ------- #
+        # Softmax on raw logits gives a proper simplex point.
+        exp_a = np.exp(actions - actions.max())  # numerically stable
+        new_weights = exp_a / exp_a.sum()
 
-        # Portfolio value (normalized)
-        normalized_value = self.portfolio_value / self.initial_amount
+        # Apply per-asset cap (hmax)
+        if self.hmax < 1.0:
+            new_weights = np.clip(new_weights, 0.0, self.hmax)
+            total = new_weights.sum()
+            new_weights = (
+                new_weights / total
+                if total > 0
+                else np.full(self.n_stocks, 1.0 / self.n_stocks)
+            )
 
-        # Portfolio weights
-        weights = self.portfolio_weights.copy()
+        # Turbulence guard: liquidate to equal-weight if threshold exceeded
+        if self.turbulence_threshold is not None and self.current_step < self.n_dates:
+            turb_col = "turbulence"
+            if turb_col in self.df.columns:
+                current_date = self.dates[self.current_step]
+                turb_val = self.df.loc[self.df["Date"] == current_date, turb_col].mean()
+                if turb_val > self.turbulence_threshold:
+                    new_weights = np.full(
+                        self.n_stocks, 1.0 / self.n_stocks, dtype=np.float32
+                    )
 
-        # Market features for each asset
-        features = []
-        for ticker in self.tickers:
-            ticker_data = current_data[current_data["tic"] == ticker]
-
-            if len(ticker_data) == 0:
-                # If no data available, use zeros
-                features.extend([0, 0, 0, 0, 0, 0])
-            else:
-                row = ticker_data.iloc[0]
-                # Normalize features
-                close_price = row["Close"] / 100 if "Close" in row else 0
-                macd = row["macd"] / 10 if "macd" in row else 0
-                rsi = row["rsi"] / 100 if "rsi" in row else 0
-                cci = row["cci"] / 100 if "cci" in row else 0
-                dx = row["dx"] / 100 if "dx" in row else 0
-                boll_ub = row["boll_ub"] / 100 if "boll_ub" in row else 0
-
-                features.extend([close_price, macd, rsi, cci, dx, boll_ub])
-
-        # Combine all state components
-        state = np.array(
-            [normalized_value] + list(weights) + features, dtype=np.float32
-        )
-
-        return state
-
-    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
-        """
-        Execute one time step in the environment.
-
-        Args:
-            actions: Portfolio weight changes
-
-        Returns:
-            Tuple of (next_state, reward, done, info)
-        """
-        # Ensure actions are valid
-        actions = np.clip(actions, -1, 1)
-
-        # Get current data
-        current_date = self.dates[self.current_step]
-        current_data = self.df[self.df["Date"] == current_date]
-
-        # Calculate new weights
-        new_weights = self.portfolio_weights + actions
-        new_weights = np.clip(new_weights, 0, 1)
-
-        # Normalize weights to sum to 1
-        weight_sum = np.sum(new_weights)
-        if weight_sum > 0:
-            new_weights = new_weights / weight_sum
-        else:
-            new_weights = np.ones(self.n_stocks) / self.n_stocks
-
-        # Calculate transaction costs
-        weight_changes = np.abs(new_weights - self.portfolio_weights)
+        # ------ Transaction costs ------------------------------------------- #
+        weight_delta = np.abs(new_weights - self.portfolio_weights).sum()
         transaction_cost = (
-            np.sum(weight_changes) * self.portfolio_value * self.transaction_cost_pct
+            weight_delta * self.portfolio_value * self.transaction_cost_pct
         )
 
-        # Update weights
-        self.portfolio_weights.copy()
-        self.portfolio_weights = new_weights
+        self.portfolio_weights = new_weights.astype(np.float32)
 
-        # Move to next time step
+        # ------ Portfolio return for this step -------------------------------- #
+        # Use pre-built price matrix — O(n_stocks) vector op, not DataFrame scan
+        prev_prices = self._price_matrix[self.current_step]
+        next_step = min(self.current_step + 1, self.n_dates - 1)
+        next_prices = self._price_matrix[next_step]
+
+        valid = prev_prices > 0
+        asset_returns = np.where(valid, (next_prices - prev_prices) / prev_prices, 0.0)
+        portfolio_return = float(self.portfolio_weights @ asset_returns)
+
+        # ------ Update portfolio value --------------------------------------- #
+        old_value = self.portfolio_value
+        self.portfolio_value = old_value * (1.0 + portfolio_return) - transaction_cost
+        self.portfolio_value = max(self.portfolio_value, 1.0)  # floor at $1
+
+        if self.portfolio_value > self.max_portfolio_value:
+            self.max_portfolio_value = self.portfolio_value
+
+        # ------ Reward -------------------------------------------------------- #
+        # Computed on every step including terminal — fixes silent zero reward
+        log_return = np.log(self.portfolio_value / old_value) if old_value > 0 else 0.0
+        current_drawdown = (
+            (self.max_portfolio_value - self.portfolio_value) / self.max_portfolio_value
+            if self.max_portfolio_value > 0
+            else 0.0
+        )
+        reward = float(
+            log_return
+            - self.max_drawdown_penalty * current_drawdown
+            - (transaction_cost / self.initial_amount)
+        )
+
+        # ------ Bookkeeping -------------------------------------------------- #
+        self.portfolio_values.append(self.portfolio_value)
+        self.portfolio_returns.append(portfolio_return)
+        self.actions_memory.append(actions)
         self.current_step += 1
+        if self.current_step < self.n_dates:
+            self.date_memory.append(self.dates[self.current_step])
 
-        # Check if episode is done
-        done = self.current_step >= len(self.dates) - 1
-
-        if not done:
-            # Get next period data
-            next_date = self.dates[self.current_step]
-            next_data = self.df[self.df["Date"] == next_date]
-
-            # Calculate portfolio return
-            portfolio_return = 0
-            for i, ticker in enumerate(self.tickers):
-                current_price_data = current_data[current_data["tic"] == ticker]
-                next_price_data = next_data[next_data["tic"] == ticker]
-
-                if len(current_price_data) > 0 and len(next_price_data) > 0:
-                    current_price = current_price_data.iloc[0]["Close"]
-                    next_price = next_price_data.iloc[0]["Close"]
-
-                    if current_price > 0:
-                        asset_return = (next_price - current_price) / current_price
-                        portfolio_return += self.portfolio_weights[i] * asset_return
-
-            # Update portfolio value
-            old_portfolio_value = self.portfolio_value
-            self.portfolio_value = (
-                self.portfolio_value * (1 + portfolio_return) - transaction_cost
-            )
-
-            # Update max portfolio value
-            if self.portfolio_value > self.max_portfolio_value:
-                self.max_portfolio_value = self.portfolio_value
-
-            # Calculate log return
-            if old_portfolio_value > 0:
-                log_return = np.log(self.portfolio_value / old_portfolio_value)
-            else:
-                log_return = 0
-
-            # Calculate maximum drawdown
-            if self.max_portfolio_value > 0:
-                current_drawdown = (
-                    self.max_portfolio_value - self.portfolio_value
-                ) / self.max_portfolio_value
-            else:
-                current_drawdown = 0
-
-            # Calculate reward with drawdown penalty
-            reward = (
-                log_return
-                - self.max_drawdown_penalty * current_drawdown
-                - (transaction_cost / self.initial_amount)
-            )
-
-            # Store metrics
-            self.portfolio_values.append(self.portfolio_value)
-            self.portfolio_returns.append(portfolio_return)
-            self.actions_memory.append(actions)
-            self.date_memory.append(next_date)
-        else:
-            reward = 0
-
-        # Get next state
         next_state = self._get_state()
-
-        # Additional info
         info = {
             "portfolio_value": self.portfolio_value,
-            "date": (
-                self.dates[self.current_step]
-                if self.current_step < len(self.dates)
-                else None
-            ),
             "transaction_cost": transaction_cost,
+            "date": self.dates[min(self.current_step, self.n_dates - 1)],
         }
+        return next_state, reward, terminated, truncated, info
 
-        return next_state, reward, done, info
-
-    def render(self, mode="human"):
-        """Render the environment state."""
+    def render(self) -> None:
         if self.current_step % self.print_verbosity == 0:
             print(
-                f"Step: {self.current_step}, Portfolio Value: ${self.portfolio_value:,.2f}"
+                f"Step {self.current_step:>5} | "
+                f"Portfolio Value: ${self.portfolio_value:>14,.2f}"
             )
 
-    def save_portfolio_values(self) -> pd.DataFrame:
-        """
-        Save portfolio values to DataFrame.
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                      #
+    # ------------------------------------------------------------------ #
 
-        Returns:
-            DataFrame with dates and portfolio values
-        """
-        df = pd.DataFrame(
+    def _get_state(self) -> np.ndarray:
+        step = min(self.current_step, self.n_dates - 1)
+
+        normalised_value = self.portfolio_value / self.initial_amount
+        weights = self.portfolio_weights.copy()
+
+        # Feature matrix already pre-computed: shape (n_stocks, n_features)
+        features_2d = self._feature_matrix[step]  # (n_stocks, 6)
+        features_flat = features_2d.ravel()  # (n_stocks * 6,)
+
+        state = np.concatenate([[normalised_value], weights, features_flat]).astype(
+            np.float32
+        )
+        return state
+
+    # ------------------------------------------------------------------ #
+    # Metrics / persistence                                                 #
+    # ------------------------------------------------------------------ #
+
+    def save_portfolio_values(self) -> pd.DataFrame:
+        return pd.DataFrame(
             {"date": self.date_memory, "portfolio_value": self.portfolio_values}
         )
-        return df
 
     def get_portfolio_metrics(self) -> Dict:
-        """
-        Calculate portfolio performance metrics.
-
-        Returns:
-            Dictionary of performance metrics
-        """
-        returns = np.array(self.portfolio_returns[1:])  # Exclude first zero return
-
+        returns = np.array(self.portfolio_returns[1:])
         if len(returns) == 0:
             return {}
 
-        # Calculate metrics
         total_return = (
             self.portfolio_value - self.initial_amount
         ) / self.initial_amount
-
-        # Annualized return (assuming 252 trading days)
         days = len(returns)
-        annual_return = (1 + total_return) ** (252 / days) - 1 if days > 0 else 0
+        annual_return = (
+            (1 + total_return) ** (TRADING_DAYS / days) - 1 if days > 0 else 0.0
+        )
+        volatility = returns.std() * np.sqrt(TRADING_DAYS)
 
-        # Volatility
-        volatility = np.std(returns) * np.sqrt(252)
-
-        # Sharpe Ratio (assume risk-free rate = 4.5%)
         risk_free_rate = 0.045
-        sharpe_ratio = (
-            (annual_return - risk_free_rate) / volatility if volatility > 0 else 0
+        sharpe = (
+            (annual_return - risk_free_rate) / volatility if volatility > 0 else 0.0
         )
 
-        # Maximum Drawdown
-        portfolio_values = np.array(self.portfolio_values)
-        peak = np.maximum.accumulate(portfolio_values)
-        drawdown = (peak - portfolio_values) / peak
-        max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
-
-        # Sortino Ratio
-        downside_returns = returns[returns < 0]
-        downside_std = (
-            np.std(downside_returns) * np.sqrt(252) if len(downside_returns) > 0 else 0
-        )
-        sortino_ratio = (
-            (annual_return - risk_free_rate) / downside_std if downside_std > 0 else 0
+        neg = returns[returns < 0]
+        downside_std = neg.std() * np.sqrt(TRADING_DAYS) if len(neg) > 0 else 0.0
+        sortino = (
+            (annual_return - risk_free_rate) / downside_std if downside_std > 0 else 0.0
         )
 
-        # CVaR (5%)
-        sorted_returns = np.sort(returns)
-        cvar_index = int(0.05 * len(sorted_returns))
-        cvar = np.mean(sorted_returns[:cvar_index]) if cvar_index > 0 else 0
+        values = np.array(self.portfolio_values)
+        peak = np.maximum.accumulate(values)
+        drawdown = (peak - values) / peak
+        max_drawdown = float(drawdown.max())
 
-        metrics = {
+        sorted_ret = np.sort(returns)
+        cvar_cut = max(1, int(0.05 * len(sorted_ret)))
+        cvar = float(sorted_ret[:cvar_cut].mean())
+
+        return {
             "total_return": total_return,
             "annual_return": annual_return,
             "volatility": volatility,
-            "sharpe_ratio": sharpe_ratio,
-            "sortino_ratio": sortino_ratio,
+            "sharpe_ratio": sharpe,
+            "sortino_ratio": sortino,
             "max_drawdown": -max_drawdown,
             "cvar_5": cvar,
         }
 
-        return metrics
-
 
 if __name__ == "__main__":
-    print("Portfolio Environment module loaded successfully")
+    print("Portfolio Environment module loaded successfully (gymnasium)")

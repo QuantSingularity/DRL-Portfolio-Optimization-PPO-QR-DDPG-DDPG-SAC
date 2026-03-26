@@ -1,188 +1,176 @@
 """
 Deep Reinforcement Learning Agents Implementation.
-
-This module implements:
-- PPO (Proximal Policy Optimization)
-- DDPG (Deep Deterministic Policy Gradient)
-- SAC (Soft Actor-Critic)
-- QR-DDPG (Quantile Regression DDPG)
 """
 
+from __future__ import annotations
+
+import random
+from collections import deque
+from typing import List, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-import numpy as np
-from typing import Tuple, List
-from collections import deque
-import random
+import torch.optim as optim
+
+# ---------------------------------------------------------------------------
+# Replay Buffer
+# ---------------------------------------------------------------------------
 
 
 class ReplayBuffer:
-    """Experience Replay Buffer for off-policy algorithms."""
 
-    def __init__(self, capacity: int = 1000000):
-        """
-        Initialize replay buffer.
+    def __init__(self, capacity: int = 1_000_000) -> None:
+        self.buffer: deque = deque(maxlen=capacity)
 
-        Args:
-            capacity: Maximum buffer size
-        """
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state, action, reward, next_state, done):
-        """Add experience to buffer."""
+    def push(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
         self.buffer.append((state, action, reward, next_state, done))
 
-    def sample(self, batch_size: int) -> Tuple:
-        """Sample a batch of experiences."""
+    def sample(self, batch_size: int) -> Tuple[np.ndarray, ...]:
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
-
         return (
-            np.array(states),
-            np.array(actions),
-            np.array(rewards),
-            np.array(next_states),
-            np.array(dones),
+            np.array(states, dtype=np.float32),
+            np.array(actions, dtype=np.float32),
+            np.array(rewards, dtype=np.float32),
+            np.array(next_states, dtype=np.float32),
+            np.array(dones, dtype=np.float32),
         )
 
-    def __len__(self):
-        """Return current buffer size."""
+    def __len__(self) -> int:
         return len(self.buffer)
 
 
+# ---------------------------------------------------------------------------
+# Network Architectures
+# ---------------------------------------------------------------------------
+
+
 class Actor(nn.Module):
-    """Actor network for policy-based algorithms."""
+    """Deterministic policy network (shared by DDPG and QR-DDPG)."""
 
     def __init__(
-        self, state_dim: int, action_dim: int, hidden_dims: List[int] = [128, 64]
-    ):
-        """
-        Initialize actor network.
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dims: List[int] = None,
+    ) -> None:
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [128, 64]
 
-        Args:
-            state_dim: Dimension of state space
-            action_dim: Dimension of action space
-            hidden_dims: List of hidden layer dimensions
-        """
-        super(Actor, self).__init__()
+        layers: list = []
+        in_dim = state_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(in_dim, h), nn.ReLU()]
+            in_dim = h
 
-        layers = []
-        input_dim = state_dim
+        self.hidden = nn.Sequential(*layers)
+        self.output = nn.Linear(in_dim, action_dim)
 
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            input_dim = hidden_dim
-
-        self.hidden_layers = nn.Sequential(*layers)
-        self.output_layer = nn.Linear(input_dim, action_dim)
-        self.tanh = nn.Tanh()
-
-    def forward(self, state):
-        """Forward pass."""
-        x = self.hidden_layers(state)
-        x = self.output_layer(x)
-        return self.tanh(x)
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self.output(self.hidden(state)))
 
 
 class Critic(nn.Module):
-    """Critic network for value-based algorithms."""
+    """Q-value network for standard DDPG."""
 
     def __init__(
-        self, state_dim: int, action_dim: int, hidden_dims: List[int] = [128, 64]
-    ):
-        """
-        Initialize critic network.
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dims: List[int] = None,
+    ) -> None:
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [128, 64]
 
-        Args:
-            state_dim: Dimension of state space
-            action_dim: Dimension of action space
-            hidden_dims: List of hidden layer dimensions
-        """
-        super(Critic, self).__init__()
+        layers: list = []
+        in_dim = state_dim + action_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(in_dim, h), nn.ReLU()]
+            in_dim = h
 
-        layers = []
-        input_dim = state_dim + action_dim
+        self.hidden = nn.Sequential(*layers)
+        self.output = nn.Linear(in_dim, 1)
 
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            input_dim = hidden_dim
-
-        self.hidden_layers = nn.Sequential(*layers)
-        self.output_layer = nn.Linear(input_dim, 1)
-
-    def forward(self, state, action):
-        """Forward pass."""
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         x = torch.cat([state, action], dim=1)
-        x = self.hidden_layers(x)
-        return self.output_layer(x)
+        return self.output(self.hidden(x))
 
 
 class QuantileCritic(nn.Module):
-    """Quantile Critic network for QR-DDPG."""
+    """
+    Distributional critic that outputs N quantile values.
+    Used by QR-DDPG for tail-risk-aware policy optimisation.
+    """
 
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
         n_quantiles: int = 50,
-        hidden_dims: List[int] = [128, 64],
-    ):
-        """
-        Initialize quantile critic network.
-
-        Args:
-            state_dim: Dimension of state space
-            action_dim: Dimension of action space
-            n_quantiles: Number of quantiles to estimate
-            hidden_dims: List of hidden layer dimensions
-        """
-        super(QuantileCritic, self).__init__()
+        hidden_dims: List[int] = None,
+    ) -> None:
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [128, 64]
 
         self.n_quantiles = n_quantiles
 
-        layers = []
-        input_dim = state_dim + action_dim
+        layers: list = []
+        in_dim = state_dim + action_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(in_dim, h), nn.ReLU()]
+            in_dim = h
 
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            input_dim = hidden_dim
+        self.hidden = nn.Sequential(*layers)
+        self.output = nn.Linear(in_dim, n_quantiles)
 
-        self.hidden_layers = nn.Sequential(*layers)
-        self.output_layer = nn.Linear(input_dim, n_quantiles)
-
-    def forward(self, state, action):
-        """
-        Forward pass.
-
-        Returns:
-            Tensor of shape (batch_size, n_quantiles) with quantile values
-        """
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Return tensor of shape (batch, n_quantiles)."""
         x = torch.cat([state, action], dim=1)
-        x = self.hidden_layers(x)
-        quantiles = self.output_layer(x)
-        return quantiles
+        return self.output(self.hidden(x))
+
+
+# ---------------------------------------------------------------------------
+# DDPG Agent
+# ---------------------------------------------------------------------------
 
 
 class DDPGAgent:
-    """Deep Deterministic Policy Gradient Agent."""
+    """
+    Deep Deterministic Policy Gradient.
+
+    Gradient clipping (max_norm=1.0) is applied to both actor and critic
+    updates to prevent exploding gradients.
+    """
+
+    _GRAD_CLIP = 1.0  # max gradient norm
 
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
-        lr_actor: float = 0.0001,
-        lr_critic: float = 0.0003,
+        lr_actor: float = 1e-4,
+        lr_critic: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 0.005,
-        buffer_size: int = 1000000,
+        buffer_size: int = 1_000_000,
         device: str = "cpu",
-    ):
-        """Initialize DDPG agent."""
+        hidden_dims: List[int] = None,
+    ) -> None:
+        if hidden_dims is None:
+            hidden_dims = [128, 64]
+
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.gamma = gamma
@@ -190,204 +178,231 @@ class DDPGAgent:
         self.device = device
 
         # Networks
-        self.actor = Actor(state_dim, action_dim).to(device)
-        self.actor_target = Actor(state_dim, action_dim).to(device)
+        self.actor = Actor(state_dim, action_dim, hidden_dims).to(device)
+        self.actor_target = Actor(state_dim, action_dim, hidden_dims).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        self.critic = Critic(state_dim, action_dim).to(device)
-        self.critic_target = Critic(state_dim, action_dim).to(device)
+        self.critic = Critic(state_dim, action_dim, hidden_dims).to(device)
+        self.critic_target = Critic(state_dim, action_dim, hidden_dims).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # Optimizers
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
 
-        # Replay buffer
         self.replay_buffer = ReplayBuffer(buffer_size)
 
+    # ------------------------------------------------------------------ #
+    # Public API                                                            #
+    # ------------------------------------------------------------------ #
+
     def select_action(self, state: np.ndarray, noise: float = 0.1) -> np.ndarray:
-        """Select action using current policy."""
-        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-
+        """Select action; add Gaussian exploration noise during training."""
+        state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            action = self.actor(state).cpu().numpy()[0]
-
-        # Add exploration noise
+            action = self.actor(state_t).cpu().numpy()[0]
         action += np.random.normal(0, noise, size=self.action_dim)
-        action = np.clip(action, -1, 1)
+        return np.clip(action, -1.0, 1.0)
 
-        return action
-
-    def update(self, batch_size: int = 128):
-        """Update actor and critic networks."""
+    def update(self, batch_size: int = 128) -> None:
         if len(self.replay_buffer) < batch_size:
             return
 
-        # Sample batch
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(
             batch_size
         )
 
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.FloatTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
+        states_t = torch.FloatTensor(states).to(self.device)
+        actions_t = torch.FloatTensor(actions).to(self.device)
+        rewards_t = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
+        next_states_t = torch.FloatTensor(next_states).to(self.device)
+        dones_t = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
 
-        # Update critic
+        # ---- Critic update ------------------------------------------------ #
         with torch.no_grad():
-            next_actions = self.actor_target(next_states)
-            target_q = self.critic_target(next_states, next_actions)
-            target_q = rewards + (1 - dones) * self.gamma * target_q
+            next_actions = self.actor_target(next_states_t)
+            target_q = self.critic_target(next_states_t, next_actions)
+            target_q = rewards_t + (1.0 - dones_t) * self.gamma * target_q
 
-        current_q = self.critic(states, actions)
+        current_q = self.critic(states_t, actions_t)
         critic_loss = F.mse_loss(current_q, target_q)
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self._GRAD_CLIP)
         self.critic_optimizer.step()
 
-        # Update actor
-        actor_loss = -self.critic(states, self.actor(states)).mean()
+        # ---- Actor update ------------------------------------------------- #
+        actor_loss = -self.critic(states_t, self.actor(states_t)).mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), self._GRAD_CLIP)
         self.actor_optimizer.step()
 
-        # Soft update target networks
+        # ---- Soft target update ------------------------------------------- #
         self._soft_update(self.actor, self.actor_target)
         self._soft_update(self.critic, self.critic_target)
 
-    def _soft_update(self, local_model, target_model):
-        """Soft update of target network."""
-        for target_param, local_param in zip(
-            target_model.parameters(), local_model.parameters()
-        ):
-            target_param.data.copy_(
-                self.tau * local_param.data + (1.0 - self.tau) * target_param.data
-            )
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _soft_update(self, local: nn.Module, target: nn.Module) -> None:
+        for tp, lp in zip(target.parameters(), local.parameters()):
+            tp.data.copy_(self.tau * lp.data + (1.0 - self.tau) * tp.data)
+
+
+# ---------------------------------------------------------------------------
+# QR-DDPG Agent
+# ---------------------------------------------------------------------------
 
 
 class QRDDPGAgent(DDPGAgent):
-    """Quantile Regression DDPG Agent."""
+    """
+    Quantile-Regression DDPG.
+    """
 
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
-        lr_actor: float = 0.0001,
-        lr_critic: float = 0.0003,
+        lr_actor: float = 1e-4,
+        lr_critic: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 0.005,
         n_quantiles: int = 50,
-        buffer_size: int = 1000000,
+        buffer_size: int = 1_000_000,
         device: str = "cpu",
-    ):
-        """Initialize QR-DDPG agent."""
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.gamma = gamma
-        self.tau = tau
-        self.n_quantiles = n_quantiles
-        self.device = device
+        hidden_dims: List[int] = None,
+    ) -> None:
+        if hidden_dims is None:
+            hidden_dims = [128, 64]
 
-        # Networks
-        self.actor = Actor(state_dim, action_dim).to(device)
-        self.actor_target = Actor(state_dim, action_dim).to(device)
-        self.actor_target.load_state_dict(self.actor.state_dict())
-
-        # Quantile critic
-        self.critic = QuantileCritic(state_dim, action_dim, n_quantiles).to(device)
-        self.critic_target = QuantileCritic(state_dim, action_dim, n_quantiles).to(
-            device
+        # Initialise base DDPG (builds actor, replay buffer, optimizers …)
+        super().__init__(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            lr_actor=lr_actor,
+            lr_critic=lr_critic,
+            gamma=gamma,
+            tau=tau,
+            buffer_size=buffer_size,
+            device=device,
+            hidden_dims=hidden_dims,
         )
+
+        self.n_quantiles = n_quantiles
+
+        # Replace the standard critic with the quantile variant
+        self.critic = QuantileCritic(
+            state_dim, action_dim, n_quantiles, hidden_dims
+        ).to(device)
+        self.critic_target = QuantileCritic(
+            state_dim, action_dim, n_quantiles, hidden_dims
+        ).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # Optimizers
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
+        # Re-create critic optimiser to point at the new network
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
 
-        # Replay buffer
-        self.replay_buffer = ReplayBuffer(buffer_size)
-
-        # Quantile midpoints
+        # Quantile mid-points τ_i = (i + 0.5) / N
         self.quantile_tau = torch.FloatTensor(
             [(i + 0.5) / n_quantiles for i in range(n_quantiles)]
         ).to(device)
 
-    def quantile_huber_loss(self, quantiles, target, tau):
-        """Calculate quantile Huber loss."""
-        pairwise_delta = target.unsqueeze(1) - quantiles.unsqueeze(2)
-        abs_pairwise_delta = torch.abs(pairwise_delta)
-        huber_loss = torch.where(
-            abs_pairwise_delta > 1, abs_pairwise_delta - 0.5, pairwise_delta**2 * 0.5
-        )
+    # ------------------------------------------------------------------ #
+    # Override update() for distributional Bellman + CVaR actor loss       #
+    # ------------------------------------------------------------------ #
 
-        quantile_loss = (
-            torch.abs(tau.unsqueeze(2) - (pairwise_delta < 0).float()) * huber_loss
-        )
-        return quantile_loss.mean()
-
-    def update(self, batch_size: int = 128):
-        """Update actor and critic networks."""
+    def update(self, batch_size: int = 128) -> None:
         if len(self.replay_buffer) < batch_size:
             return
 
-        # Sample batch
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(
             batch_size
         )
 
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.FloatTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).to(self.device)
+        states_t = torch.FloatTensor(states).to(self.device)
+        actions_t = torch.FloatTensor(actions).to(self.device)
+        rewards_t = torch.FloatTensor(rewards).to(self.device)
+        next_states_t = torch.FloatTensor(next_states).to(self.device)
+        dones_t = torch.FloatTensor(dones).to(self.device)
 
-        # Update critic
+        # ---- Distributional critic update ---------------------------------- #
         with torch.no_grad():
-            next_actions = self.actor_target(next_states)
-            target_quantiles = self.critic_target(next_states, next_actions)
+            next_actions = self.actor_target(next_states_t)
+            target_quantiles = self.critic_target(next_states_t, next_actions)
+            # shape: (batch, n_quantiles)
             target_quantiles = (
-                rewards.unsqueeze(1)
-                + (1 - dones.unsqueeze(1)) * self.gamma * target_quantiles
+                rewards_t.unsqueeze(1)
+                + (1.0 - dones_t.unsqueeze(1)) * self.gamma * target_quantiles
             )
 
-        current_quantiles = self.critic(states, actions)
-        critic_loss = self.quantile_huber_loss(
+        current_quantiles = self.critic(states_t, actions_t)  # (batch, n_quantiles)
+        critic_loss = self._quantile_huber_loss(
             current_quantiles, target_quantiles, self.quantile_tau
         )
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self._GRAD_CLIP)
         self.critic_optimizer.step()
 
-        # Update actor (use lower quantiles for risk-averse policy)
-        quantiles = self.critic(states, self.actor(states))
-        # Use CVaR (mean of lowest 5% quantiles)
+        # ---- CVaR actor update --------------------------------------------- #
+        # Maximise the mean of the lowest 5 % quantiles (most pessimistic)
+        quantiles = self.critic(states_t, self.actor(states_t))  # (batch, n_quantiles)
         n_cvar = max(1, int(0.05 * self.n_quantiles))
         actor_loss = -quantiles[:, :n_cvar].mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), self._GRAD_CLIP)
         self.actor_optimizer.step()
 
-        # Soft update target networks
+        # ---- Soft target update ------------------------------------------- #
         self._soft_update(self.actor, self.actor_target)
         self._soft_update(self.critic, self.critic_target)
 
+    # ------------------------------------------------------------------ #
+    # Quantile Huber loss                                                   #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _quantile_huber_loss(
+        quantiles: torch.Tensor,
+        targets: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        quantiles : (batch, N)   – predicted quantile values
+        targets   : (batch, N)   – Bellman target quantile values
+        tau       : (N,)         – quantile levels
+
+        Returns
+        -------
+        scalar loss
+        """
+        # pairwise_delta: (batch, N_pred, N_target)
+        pairwise_delta = targets.unsqueeze(1) - quantiles.unsqueeze(2)
+        abs_delta = pairwise_delta.abs()
+        huber = torch.where(abs_delta > 1.0, abs_delta - 0.5, 0.5 * pairwise_delta**2)
+        quantile_loss = (tau.unsqueeze(2) - (pairwise_delta < 0).float()).abs() * huber
+        return quantile_loss.mean()
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    _state_dim, _action_dim = 100, 10
+
+    ddpg = DDPGAgent(_state_dim, _action_dim)
+    qr = QRDDPGAgent(_state_dim, _action_dim, n_quantiles=50)
+
+    _s = np.zeros(_state_dim)
+    print("DDPG action:", ddpg.select_action(_s).shape)
+    print("QR-DDPG action:", qr.select_action(_s).shape)
     print("DRL Agents module loaded successfully")
-
-    # Test agent initialization
-    state_dim = 100
-    action_dim = 10
-
-    ddpg = DDPGAgent(state_dim, action_dim)
-    qr_ddpg = QRDDPGAgent(state_dim, action_dim)
-
-    print(f"DDPG initialized: state_dim={state_dim}, action_dim={action_dim}")
-    print(
-        f"QR-DDPG initialized: state_dim={state_dim}, action_dim={action_dim}, n_quantiles=50"
-    )
