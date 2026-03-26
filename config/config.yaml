@@ -1,7 +1,6 @@
-# Enhanced Configuration for RL Portfolio Optimization
-# Includes transaction cost analysis, market constraints, regime analysis, etc.
+# Configuration for RL Portfolio Optimization
 
-# Data Configuration
+# ── Data ──────────────────────────────────────────────────────────────────────
 data:
   start_date: "2015-01-01"
   end_date: "2024-12-31"
@@ -10,7 +9,8 @@ data:
   test_start: "2023-01-01"
   test_end: "2024-12-31"
 
-  # Asset Universe (25 assets across 4 asset classes)
+  # Investable asset universe (25 assets, 4 classes)
+  # NOTE: ^VIX is NOT listed here — it is not a tradeable instrument.
   assets:
     equities:
       - AAPL # Apple
@@ -45,7 +45,7 @@ data:
       - LQD # Investment Grade Corporate Bond ETF
       - HYG # High Yield Corporate Bond ETF
 
-  # Technical Indicators
+  # Technical indicators computed by DataProcessor
   technical_indicators:
     - macd
     - rsi
@@ -54,27 +54,28 @@ data:
     - boll_ub
     - boll_lb
 
-  # Macroeconomic Factors
+  # Macroeconomic factors — downloaded for state features / turbulence
+  # but EXCLUDED from the portfolio weight vector (not tradeable).
   macro_factors:
-    - ^VIX # VIX Volatility Index
+    - ^VIX # CBOE Volatility Index
 
-# Environment Configuration
+# ── Environment ───────────────────────────────────────────────────────────────
 environment:
   initial_amount: 1000000
-  transaction_cost_pct: 0.001 # 0.1% - baseline
+  transaction_cost_pct: 0.001 # 0.1% one-way
   slippage_coefficient: 0.05
   reward_scaling: 1.0
-  hmax: 100
-  print_verbosity: 5
+  hmax: 0.30 # max weight per asset (fraction, e.g. 0.30 = 30%)
+  print_verbosity: 50
 
-# Transaction Cost Analysis Configuration
+# ── Transaction Cost Analysis ─────────────────────────────────────────────────
 transaction_costs:
   enabled: true
   cost_structures:
-    retail: 0.005 # 0.5% - retail investor
-    standard: 0.001 # 0.1% - standard
-    institutional: 0.0005 # 0.05% - institutional
-    zero: 0.0 # 0% - for comparison
+    retail: 0.005 # 0.5%
+    standard: 0.001 # 0.1%
+    institutional: 0.0005 # 0.05%
+    zero: 0.0 # baseline comparison
   rebalance_frequencies:
     daily: 1
     weekly: 5
@@ -83,33 +84,33 @@ transaction_costs:
     quarterly: 60
   analysis_output: "./results/transaction_cost_analysis"
 
-# Market Constraints Configuration
+# ── Market Constraints ────────────────────────────────────────────────────────
 constraints:
   enabled: true
-  short_selling: false # Allow short selling
-  max_leverage: 1.0 # 1.0 = no leverage, 2.0 = 2x leverage
-  max_position_size: 0.3 # Maximum 30% per asset
-  min_position_size: 0.0 # Minimum 0% per asset
+  short_selling: false
+  max_leverage: 1.0
+  max_position_size: 0.30
+  min_position_size: 0.0
   sector_exposure_limits:
-    equities: 0.6 # Max 60% in equities
-    cryptocurrencies: 0.3 # Max 30% in crypto
-    commodities: 0.3 # Max 30% in commodities
-    fixed_income: 0.5 # Max 50% in bonds
+    equities: 0.60
+    cryptocurrencies: 0.30
+    commodities: 0.30
+    fixed_income: 0.50
 
-# Reward Function Ablation Study Configuration
+# ── Reward Ablation Study ─────────────────────────────────────────────────────
 reward_ablation:
   enabled: true
   lambda_values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-  n_seeds: 5
+  n_seeds: 3
   output_dir: "./results/reward_ablation"
 
-# Market Regime Analysis Configuration
+# ── Market Regime Analysis ────────────────────────────────────────────────────
 regime_analysis:
   enabled: true
   methods:
-    - "volatility" # VIX-based
-    - "trend" # Moving average crossover
-    - "returns" # Return-based clustering
+    - volatility # VIX-based
+    - trend # MA crossover
+    - returns # rolling return clustering
   regime_definitions:
     bull:
       vix_threshold: 20
@@ -122,14 +123,14 @@ regime_analysis:
       return_range: [-0.05, 0.10]
   output_dir: "./results/regime_analysis"
 
-# Risk Management
+# ── Risk Management ───────────────────────────────────────────────────────────
 risk:
-  max_drawdown_penalty: 0.5 # Lambda coefficient
-  risk_free_rate: 0.045 # 4.5% annual
-  cvar_alpha: 0.05 # 5% for CVaR calculation
-  var_alpha: 0.05 # 5% for VaR calculation
+  max_drawdown_penalty: 0.5
+  risk_free_rate: 0.045
+  cvar_alpha: 0.05
+  var_alpha: 0.05
 
-# Model Hyperparameters
+# ── Model Hyperparameters ─────────────────────────────────────────────────────
 models:
   ppo:
     n_steps: 2048
@@ -143,7 +144,7 @@ models:
     vf_coef: 0.5
     policy_kwargs:
       net_arch: [128, 64]
-      activation_fn: "relu"
+      activation_fn: relu
 
   qr_ddpg:
     learning_rate_actor: 0.0001
@@ -176,43 +177,53 @@ models:
     policy_kwargs:
       net_arch: [128, 64]
 
-# Training Configuration
+# ── Training ──────────────────────────────────────────────────────────────────
 training:
-  total_timesteps: 100000
+  # 100_000 is too low to converge with 25 assets.
+  # 500_000 is a practical minimum; use 1_000_000+ for research-quality runs.
+  total_timesteps: 500000
   n_eval_episodes: 10
   eval_freq: 5000
-  n_seeds: 10
+  # Reduced from 10 to 3 for practical runtime.
+  # Set to 10 for full statistical robustness (papers / final evaluation).
+  n_seeds: 3
   log_interval: 100
   save_freq: 10000
 
-# Extended Benchmark Strategies
+# ── Benchmark Strategies ──────────────────────────────────────────────────────
 benchmarks:
   - equal_weight
   - mvo
   - risk_parity
   - minimum_volatility
   - momentum
-  - sixty_forty # 60/40 stocks/bonds
-  - all_weather # Ray Dalio's All Weather
-  - minimum_correlation # Minimum correlation portfolio
+  - sixty_forty
+  - all_weather
+  - minimum_correlation
 
-# Production Deployment Configuration
+# ── Production ────────────────────────────────────────────────────────────────
 production:
   api:
     host: "0.0.0.0"
     port: 8000
     workers: 4
     reload: false
-    log_level: "info"
+    log_level: info
+    # Explicit CORS allowlist — replaces the insecure allow_origins="*"
+    # Add your frontend origin(s) here.
+    allowed_origins:
+      - "http://localhost"
+      - "http://localhost:3000"
+      # - "https://your-production-domain.com"
 
   database:
-    host: "localhost"
+    host: localhost
     port: 5432
-    name: "portfolio_db"
-    user: "portfolio_user"
+    name: portfolio_db
+    user: portfolio_user
 
   redis:
-    host: "localhost"
+    host: localhost
     port: 6379
     db: 0
 
@@ -222,14 +233,14 @@ production:
     grafana_port: 3000
 
   rebalancing:
-    frequency: "weekly" # daily, weekly, monthly
-    time: "09:30" # Market open time
-    timezone: "US/Eastern"
+    frequency: weekly # daily | weekly | monthly
+    time: "09:30"
+    timezone: US/Eastern
 
   risk_monitoring:
-    max_drawdown_alert: 0.15 # Alert if drawdown > 15%
-    var_limit: 0.05 # VaR limit
-    position_limit_alert: 0.35 # Alert if position > 35%
+    max_drawdown_alert: 0.15
+    var_limit: 0.05
+    position_limit_alert: 0.35
 
   reporting:
     daily_report: true
@@ -239,7 +250,7 @@ production:
     report_recipients:
       - "portfolio@example.com"
 
-# Output Configuration
+# ── Output Paths ──────────────────────────────────────────────────────────────
 output:
   results_dir: "./results"
   models_dir: "./models"
