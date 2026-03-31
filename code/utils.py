@@ -2,9 +2,10 @@
 Utility functions for the project.
 """
 
+from typing import Dict, List
+
 import numpy as np
 import pandas as pd
-from typing import Dict, List
 
 
 def calculate_portfolio_metrics(

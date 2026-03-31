@@ -11,10 +11,9 @@ from __future__ import annotations
 import warnings
 from typing import Any, Dict, Optional, Tuple
 
+import gymnasium as gym
 import numpy as np
 import pandas as pd
-
-import gymnasium as gym
 from gymnasium import spaces
 
 warnings.filterwarnings("ignore")
